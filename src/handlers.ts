@@ -286,17 +286,11 @@ async function debitBalance(
 
 export async function handleUpdate(update: TgUpdate): Promise<void> {
   try {
-    // Handle pre_checkout_query — AltGram sends it for Stars invoices
-    // Even though answerPreCheckoutQuery may return 501, we need to handle it
+    // Handle pre_checkout_query — AltGram НЕ поддерживает answerPreCheckoutQuery (400 BAD_REQUEST)
+    // Просто игнорируем pre_checkout_query — AltGram сам обработает платёж
+    // и пришлёт successful_payment после оплаты
     if (update.pre_checkout_query) {
-      try {
-        await altgram.answerPreCheckoutQuery?.({
-          pre_checkout_query_id: update.pre_checkout_query.id,
-          ok: true,
-        })
-      } catch {
-        // answerPreCheckoutQuery may return 501 — ignore
-      }
+      console.log('[pre_checkout] Ignoring (AltGram auto-processes)')
       return
     }
 
