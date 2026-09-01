@@ -89,6 +89,7 @@ async function main() {
     { command: 'withdraw', description: 'Вывести: /withdraw 50' },
     { command: 'pay', description: 'Перевести: /pay @user 50' },
     { command: 'donate', description: 'Донат боту: /donate 100' },
+    { command: 'sendgift', description: '[админ] Отправить gift: /sendgift @user 1000 5' },
     { command: 'duel', description: 'Дуэль: /duel 100 или /duel @user 100' },
     { command: 'cancel', description: 'Отменить дуэль' },
     { command: 'daily', description: 'Ежедневный бонус' },

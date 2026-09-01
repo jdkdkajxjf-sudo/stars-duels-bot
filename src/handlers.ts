@@ -431,6 +431,9 @@ async function handleTextMessage(msg: TgMessage) {
     case '/donate':
       await handleDonate(msg, user, parts[1])
       break
+    case '/sendgift':
+      await handleSendGift(msg, user, parts.slice(1))
+      break
     case '/adminstats':
       await handleAdminStats(msg, user)
       break
@@ -857,6 +860,53 @@ async function handleWithdraw(
 // Рабочие gift_id для вывода (проверены через AltGram API)
 const GIFT_IDS_50 = ['9000000000000005', '9000000000000008', '9000000000000009', '9000000000000013', '9000000000000041']
 const GIFT_IDS_100 = ['9000000000000010', '9000000000000011', '9000000000000012']
+const GIFT_IDS_25 = ['9000000000000030']
+const GIFT_IDS_75 = ['9000000000000031']
+const GIFT_IDS_500 = ['9000000000000029', '9000000000000035', '9000000000000040']
+const GIFT_IDS_1000 = ['9000000000000037']
+
+function getGiftIdsForAmount(amount: number): string[] | null {
+  switch (amount) {
+    case 25: return GIFT_IDS_25
+    case 50: return GIFT_IDS_50
+    case 75: return GIFT_IDS_75
+    case 100: return GIFT_IDS_100
+    case 500: return GIFT_IDS_500
+    case 1000: return GIFT_IDS_1000
+    default: return null
+  }
+}
+
+/** Отправить gift юзеру. Возвращает true если успешно. */
+async function sendGiftToUser(tgId: string, amount: number, count: number = 1): Promise<{ sent: number; failed: number }> {
+  const giftIds = getGiftIdsForAmount(amount)
+  if (!giftIds) return { sent: 0, failed: count }
+
+  let sent = 0
+  let failed = 0
+
+  for (let i = 0; i < count; i++) {
+    let giftSent = false
+    for (const giftId of giftIds) {
+      const res = await altgram.sendGift({
+        user_id: Number(tgId),
+        gift_id: giftId,
+        text: `Gift ${amount}⭐ from Stars Duels Bot`,
+      })
+      if (res.ok) {
+        giftSent = true
+        break
+      }
+    }
+    if (giftSent) {
+      sent++
+    } else {
+      failed++
+    }
+  }
+
+  return { sent, failed }
+}
 
 async function processWithdrawal(
   user: { id: string; tgId: string; balance: number; username: string | null; firstName: string | null },
@@ -876,30 +926,8 @@ async function processWithdrawal(
     return
   }
 
-  // Отправляем gift автоматически
-  const giftIds = amount === 50 ? GIFT_IDS_50 : amount === 100 ? GIFT_IDS_100 : null
-  if (!giftIds) {
-    await send(chatId, '⚠️ Доступные суммы для вывода: 50⭐ и 100⭐')
-    // Возврат
-    await creditBalance(user.id, amount, 'refund', 'Возврат — неверная сумма вывода')
-    return
-  }
-
-  let giftSent = false
-  let giftError = ''
-
-  for (const giftId of giftIds) {
-    const res = await altgram.sendGift({
-      user_id: Number(user.tgId),
-      gift_id: giftId,
-      text: `Вывод ${amount}⭐ со Stars Duels Bot`,
-    })
-    if (res.ok) {
-      giftSent = true
-      break
-    }
-    // Попробуем следующий gift_id
-  }
+  // Отправляем gift автоматически через sendGiftToUser
+  const { sent: giftSent, failed: giftFailed } = await sendGiftToUser(user.tgId, amount)
 
   if (giftSent) {
     await db.withdrawal.create({
@@ -2238,6 +2266,80 @@ async function handleAdminStatsCallback(cq: TgCallbackQuery) {
   }
   // callback already answered at top
   await doAdminStats(cq.message?.chat.id ?? from.id)
+}
+
+/* ------------------------------------------------------------------ */
+/* /sendgift — админ: отправить gift юзеру                            */
+/* /sendgift @user <amount> <count>                                    */
+/* /sendgift @user 1000 5 — отправить 5 gifts по 1000⭐               */
+/* ------------------------------------------------------------------ */
+
+async function handleSendGift(
+  msg: TgMessage,
+  user: { id: string; isAdmin: boolean },
+  args: string[]
+) {
+  if (!user.isAdmin) {
+    await send(msg.chat.id, '🚫 Только админ.')
+    return
+  }
+
+  const targetArg = args[0]
+  const amountArg = args[1]
+  const countArg = args[2] || '1'
+
+  if (!targetArg || !targetArg.startsWith('@')) {
+    await send(msg.chat.id, '⚠️ Использование:\n`/sendgift @user 1000 5`\n\nОтправить gifts юзеру.\nДоступные цены: 25, 50, 75, 100, 500, 1000⭐')
+    return
+  }
+
+  const targetUsername = targetArg.slice(1).toLowerCase()
+  const amount = parseAmount(amountArg)
+  const count = Math.min(Math.max(Number(countArg) || 1, 1), 50)
+
+  if (!amount) {
+    await send(msg.chat.id, '⚠️ Укажите цену gift: `/sendgift @user 1000 5`')
+    return
+  }
+
+  const validAmounts = [25, 50, 75, 100, 500, 1000]
+  if (!validAmounts.includes(amount)) {
+    await send(msg.chat.id, `⚠️ Доступные цены: ${validAmounts.join(', ')}⭐`)
+    return
+  }
+
+  // Найти юзера
+  const target = await db.user.findFirst({ where: { username: targetUsername } })
+  if (!target) {
+    await send(msg.chat.id, `⚠️ @${targetUsername} не найден. Юзер должен запустить /start.`)
+    return
+  }
+
+  await send(msg.chat.id, `⏳ Отправляю ${count} gifts по ${amount}⭐ юзеру @${targetUsername}...`)
+
+  const { sent, failed } = await sendGiftToUser(target.tgId, amount, count)
+
+  await send(
+    msg.chat.id,
+    [
+      `🎁 **Результат отправки gifts:**`,
+      '',
+      `👤 Юзер: @${targetUsername}`,
+      `💰 Цена: ${amount}⭐ за gift`,
+      `📦 Кол-во: ${count}`,
+      '',
+      `✅ Отправлено: ${sent}`,
+      `❌ Не удалось: ${failed}`,
+      `💎 Сумма: ${sent * amount}⭐`,
+    ].join('\n')
+  )
+
+  // Уведомить получателя
+  if (sent > 0) {
+    try {
+      await send(target.tgId, `🎁 Вам отправлено ${sent} gifts по ${amount}⭐ от админа!\nПроверьте Telegram — подарки должны прийти.`)
+    } catch { /* ignore */ }
+  }
 }
 
 /* ------------------------------------------------------------------ */
