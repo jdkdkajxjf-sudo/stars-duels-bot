@@ -1,0 +1,25 @@
+# Render.com deployment config
+# Free tier: 512MB RAM, Docker support, no card required
+# Note: free tier sleeps after 15 min — use UptimeRobot to ping /health
+
+services:
+  - type: web
+    name: stars-duels-bot
+    env: docker
+    region: frankfurt
+    plan: free
+    healthCheckPath: /health
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALTGRAM_API_URL
+        value: http://188.134.95.254:2610
+      - key: ADMIN_USERNAME
+        value: crash
+      - key: COMMISSION_RATE
+        value: "0.10"
+      - key: DATABASE_URL
+        sync: false
+      - key: PORT
+        value: "3006"

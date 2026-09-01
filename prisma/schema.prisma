@@ -1,0 +1,162 @@
+// Stars Duels Bot — Prisma schema
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String   @id @default(cuid())
+  tgId          String   @unique
+  username      String?
+  firstName     String?
+  lastName      String?
+  isAdmin       Boolean  @default(false)
+  isBanned      Boolean  @default(false)
+  balance       Int      @default(0)
+  referralCode  String?  @unique
+  referredById  String?
+  duelsPlayed   Int      @default(0)
+  duelsWon      Int      @default(0)
+  duelsLost     Int      @default(0)
+  duelsDrawn    Int      @default(0)
+  totalEarned   Int      @default(0)
+  totalLost     Int      @default(0)
+  bestStreak    Int      @default(0)
+  currentStreak Int      @default(0)
+  lastDuelAt    DateTime?
+  lastDuelsReset DateTime?
+  duelsThisHour Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  transactions  Transaction[]
+  dailyClaims   DailyClaim[]
+  withdrawals   Withdrawal[]
+  promoRedemptions PromoRedemption[]
+  fastClicksWon  FastClick[]
+  duelsAsPlayer1 Duel[] @relation("DuelPlayer1")
+  duelsAsPlayer2 Duel[] @relation("DuelPlayer2")
+  duelsWonRel   Duel[]  @relation("DuelWinner")
+  referrals     User[]  @relation("UserReferrals")
+  referrer      User?   @relation("UserReferrals", fields: [referredById], references: [id])
+}
+
+model Duel {
+  id            String   @id @default(cuid())
+  chatId        String
+  chatType      String
+  player1TgId   String
+  player2TgId   String?
+  amount        Int
+  status        String   @default("waiting")
+  winnerTgId    String?
+  player1Roll   String?
+  player2Roll   String?
+  player1Sum    Int?
+  player2Sum    Int?
+  commission    Int      @default(0)
+  message1TgId  String?
+  message2TgId  String?
+  createdAt     DateTime @default(now())
+  acceptedAt    DateTime?
+  paid1At       DateTime?
+  paid2At       DateTime?
+  finishedAt    DateTime?
+
+  player1       User     @relation("DuelPlayer1", fields: [player1TgId], references: [tgId])
+  player2       User?    @relation("DuelPlayer2", fields: [player2TgId], references: [tgId])
+  winner        User?    @relation("DuelWinner", fields: [winnerTgId], references: [tgId])
+
+  @@index([player1TgId])
+  @@index([player2TgId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Transaction {
+  id            String   @id @default(cuid())
+  userId        String
+  type          String
+  amount        Int
+  balanceAfter  Int
+  note          String?
+  duelId        String?
+  createdAt     DateTime @default(now())
+
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+model PromoCode {
+  id            String   @id @default(cuid())
+  code          String   @unique
+  starsReward   Int
+  maxUses       Int      @default(1)
+  usedCount     Int      @default(0)
+  expiresAt     DateTime?
+  isActive      Boolean  @default(true)
+  createdByTgId String?
+  createdAt     DateTime @default(now())
+
+  redemptions   PromoRedemption[]
+}
+
+model PromoRedemption {
+  id            String   @id @default(cuid())
+  promoId       String
+  userId        String
+  createdAt     DateTime @default(now())
+
+  promo         PromoCode @relation(fields: [promoId], references: [id], onDelete: Cascade)
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([promoId, userId])
+  @@index([userId])
+}
+
+model FastClick {
+  id            String   @id @default(cuid())
+  amount        Int
+  chatId        String
+  messageId     String?
+  winnerTgId    String?
+  status        String   @default("active")
+  createdAt     DateTime @default(now())
+  expiresAt     DateTime
+
+  winner        User?    @relation(fields: [winnerTgId], references: [tgId])
+
+  @@index([status])
+  @@index([chatId])
+}
+
+model DailyClaim {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  lastClaim     DateTime
+  streak        Int      @default(1)
+
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Withdrawal {
+  id            String   @id @default(cuid())
+  userId        String
+  amount        Int
+  status        String   @default("pending")
+  giftSlug      String?
+  note          String?
+  createdAt     DateTime @default(now())
+  fulfilledAt   DateTime?
+
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+}

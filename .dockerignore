@@ -1,0 +1,8 @@
+node_modules
+.next
+*.log
+.offset.json
+*.db
+*.db-journal
+.git
+.env

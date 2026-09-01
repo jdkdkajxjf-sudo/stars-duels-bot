@@ -1,0 +1,35 @@
+# fly.toml — Stars Duels Bot deployment config
+#
+# Deploy:
+#   flyctl deploy
+#
+# Setup Postgres (free):
+#   flyctl postgres create
+#   flyctl postgres attach <postgres-app-name>
+#
+# Set secrets:
+#   flyctl secrets set BOT_TOKEN="1780243657:e1oGVqbBVONGBiztoHaGkmlDowOlAToaNRZ"
+#   flyctl secrets set ALTGRAM_API_URL="http://188.134.95.254:2610"
+#   flyctl secrets set ADMIN_USERNAME="crash"
+#   flyctl secrets set COMMISSION_RATE="0.10"
+
+app = "stars-duels-bot"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "3006"
+
+[http_service]
+  internal_port = 3006
+  force_https = false
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256

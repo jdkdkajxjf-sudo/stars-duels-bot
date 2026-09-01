@@ -1,0 +1,16 @@
+{
+  "name": "stars-duels-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot index.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.11.1",
+    "prisma": "^6.11.1"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.4"
+  }
+}
