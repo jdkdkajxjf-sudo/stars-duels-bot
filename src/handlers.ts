@@ -854,6 +854,10 @@ async function handleWithdraw(
   await processWithdrawal(user, amount, msg.chat.id)
 }
 
+// Рабочие gift_id для вывода (проверены через AltGram API)
+const GIFT_IDS_50 = ['9000000000000005', '9000000000000008', '9000000000000009', '9000000000000013', '9000000000000041']
+const GIFT_IDS_100 = ['9000000000000010', '9000000000000011', '9000000000000012']
+
 async function processWithdrawal(
   user: { id: string; tgId: string; balance: number; username: string | null; firstName: string | null },
   amount: number,
@@ -864,6 +868,7 @@ async function processWithdrawal(
     return
   }
 
+  // Списываем с баланса
   try {
     await debitBalance(user.id, amount, 'withdraw', `Вывод ${amount}⭐ через gift`)
   } catch {
@@ -871,25 +876,71 @@ async function processWithdrawal(
     return
   }
 
-  await db.withdrawal.create({
-    data: {
-      userId: user.id,
-      amount,
-      status: 'pending',
-      note: 'Запрос на вывод через Telegram gift',
-    },
-  })
+  // Отправляем gift автоматически
+  const giftIds = amount === 50 ? GIFT_IDS_50 : amount === 100 ? GIFT_IDS_100 : null
+  if (!giftIds) {
+    await send(chatId, '⚠️ Доступные суммы для вывода: 50⭐ и 100⭐')
+    // Возврат
+    await creditBalance(user.id, amount, 'refund', 'Возврат — неверная сумма вывода')
+    return
+  }
 
-  await send(
-    chatId,
-    `✅ Запрос на вывод **${amount}⭐** принят!\nПодарок будет отправлен в течение 24 часов.`
-  )
+  let giftSent = false
+  let giftError = ''
 
+  for (const giftId of giftIds) {
+    const res = await altgram.sendGift({
+      user_id: Number(user.tgId),
+      gift_id: giftId,
+      text: `Вывод ${amount}⭐ со Stars Duels Bot`,
+    })
+    if (res.ok) {
+      giftSent = true
+      break
+    }
+    // Попробуем следующий gift_id
+  }
+
+  if (giftSent) {
+    await db.withdrawal.create({
+      data: {
+        userId: user.id,
+        amount,
+        status: 'fulfilled',
+        note: `Gift отправлен автоматически`,
+        fulfilledAt: new Date(),
+      },
+    })
+
+    await send(
+      chatId,
+      `✅ **Вывод выполнен!**\n🎁 Подарок на ${amount}⭐ отправлен вам!\nПроверьте Telegram — подарок должен прийти.`
+
+    )
+  } else {
+    // Gift не отправился — возвращаем звёзды
+    await creditBalance(user.id, amount, 'refund', 'Возврат — gift не отправлен')
+    await db.withdrawal.create({
+      data: {
+        userId: user.id,
+        amount,
+        status: 'failed',
+        note: 'Gift не доступен — возврат средств',
+      },
+    })
+    await send(
+      chatId,
+      `❌ Не удалось отправить подарок. Звёзды возвращены на баланс.\nПопробуйте позже или обратитесь к админу.`
+    )
+  }
+
+  // Уведомить админа
   const admin = await db.user.findFirst({ where: { isAdmin: true } })
   if (admin) {
+    const senderName = user.username ? `@${user.username}` : user.firstName || `Игрок ${user.tgId.slice(-4)}`
     await send(
       admin.tgId,
-      `💸 Новый запрос на вывод:\n${mention(user)} (tgId: ${user.tgId}) — ${amount}⭐`
+      `💸 Вывод: ${senderName} — ${amount}⭐ — ${giftSent ? '✅ выполнен' : '❌ не выполнен (возврат)'}`
     )
   }
 }

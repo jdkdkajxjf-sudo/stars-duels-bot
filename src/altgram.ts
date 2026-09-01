@@ -157,8 +157,8 @@ export const altgram = {
     return tgFetch<boolean>('sendGift', params)
   },
 
-  async getGifts() {
-    return tgFetch<{ gifts: Array<{ id: string; sticker: { file_id: string }; star_count: number }> }>('getGifts', {})
+  async getAvailableGifts() {
+    return tgFetch<{ count: number; gifts: Array<{ id: string; star_count: number; convert_star_count: number; sticker: { emoji: string; file_id: string }; remaining_count?: number }> }>('getAvailableGifts', {})
   },
 
   async deleteMessage(params: { chat_id: number | string; message_id: number }) {
