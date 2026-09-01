@@ -100,7 +100,7 @@ export const altgram = {
   api: ALTGRAM_API_URL,
 
   async getMe() {
-    return tgFetch<{ id: number; is_bot: boolean; first_name: string; username: string }>('getMe')
+    return tgFetch<{ id: number; is_bot: boolean; first_name: string; username: string }>('getMe', {})
   },
 
   async sendMessage(params: {
@@ -158,7 +158,7 @@ export const altgram = {
   },
 
   async getGifts() {
-    return tgFetch<{ gifts: Array<{ id: string; sticker: { file_id: string }; star_count: number }> }>('getGifts')
+    return tgFetch<{ gifts: Array<{ id: string; sticker: { file_id: string }; star_count: number }> }>('getGifts', {})
   },
 
   async deleteMessage(params: { chat_id: number | string; message_id: number }) {
@@ -175,5 +175,13 @@ export const altgram = {
 
   async deleteWebhook() {
     return tgFetch<boolean>('deleteWebhook', {})
+  },
+
+  async answerPreCheckoutQuery(params: {
+    pre_checkout_query_id: string
+    ok: boolean
+    error_message?: string
+  }) {
+    return tgFetch<boolean>('answerPreCheckoutQuery', params)
   },
 }

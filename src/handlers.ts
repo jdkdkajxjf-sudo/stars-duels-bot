@@ -11,8 +11,69 @@ import type { TgCallbackQuery, TgMessage, TgUpdate, TgUser } from './types'
 
 const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || 'crash').toLowerCase()
 const COMMISSION_RATE = Number(process.env.COMMISSION_RATE || '0.10')
-const MIN_BET = 10
+const MIN_BET = 15  // Минимальная ставка — 15⭐
 const MAX_BET = 5000
+
+/**
+ * ЗАЩИТА ОТ СБОЕВ — вызывается при старте бота.
+ * Возвращает ставки всем, кто оплатил дуэль но она не завершилась.
+ * Отменяет все незавершённые дуэли.
+ */
+export async function recoverStuckDuels() {
+  try {
+    // Найти все дуэли в статусе accepted/paid/rolling (оплачены но не завершены)
+    const stuck = await db.duel.findMany({
+      where: { status: { in: ['accepted', 'paid', 'rolling'] } },
+    })
+
+    if (stuck.length === 0) {
+      console.log('[recovery] No stuck duels found')
+      return
+    }
+
+    console.log(`[recovery] Found ${stuck.length} stuck duels, refunding...`)
+
+    for (const duel of stuck) {
+      // Возврат оплатившему player1
+      if (duel.paid1At) {
+        const u1 = await db.user.findUnique({ where: { tgId: duel.player1TgId } })
+        if (u1) {
+          await creditBalance(u1.id, duel.amount, 'refund', `Возврат при сбое — дуэль ${duel.id.slice(-8)}`, duel.id)
+          try {
+            await send(u1.tgId, `⚠️ **Сервер был перезапущен.**\nДуэль отменена.\n💰 Возврат ${duel.amount}⭐.\nБаланс: ${(await db.user.findUnique({ where: { id: u1.id } }))?.balance ?? 0}⭐`)
+          } catch { /* ignore */ }
+        }
+      }
+
+      // Возврат оплатившему player2
+      if (duel.paid2At && duel.player2TgId) {
+        const u2 = await db.user.findUnique({ where: { tgId: duel.player2TgId } })
+        if (u2) {
+          await creditBalance(u2.id, duel.amount, 'refund', `Возврат при сбое — дуэль ${duel.id.slice(-8)}`, duel.id)
+          try {
+            await send(u2.tgId, `⚠️ **Сервер был перезапущен.**\nДуэль отменена.\n💰 Возврат ${duel.amount}⭐.\nБаланс: ${(await db.user.findUnique({ where: { id: u2.id } }))?.balance ?? 0}⭐`)
+          } catch { /* ignore */ }
+        }
+      }
+
+      // Отменить дуэль
+      await db.duel.update({
+        where: { id: duel.id },
+        data: { status: 'cancelled' },
+      })
+    }
+
+    // Также отменяем waiting дуэли (никто не принял)
+    const waiting = await db.duel.updateMany({
+      where: { status: 'waiting' },
+      data: { status: 'timed_out' },
+    })
+
+    console.log(`[recovery] Refunded ${stuck.length} duels, cancelled ${waiting.count} waiting duels`)
+  } catch (e) {
+    console.error('[recovery] Error:', e)
+  }
+}
 const NEW_USER_MAX_BET = 100
 const NEW_USER_HOURS = 24
 const DUEL_COOLDOWN_MS = 30_000
@@ -22,6 +83,7 @@ const PAY_TIMEOUT_MS = 5 * 60_000
 const FAST_CLICK_TIMEOUT_MS = 60_000
 
 const DICE_EMOJI = ['⚀', '⚁', '⚂', '⚃', '⚄', '⚅']
+const DICE_FACE = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣']
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -90,12 +152,14 @@ function parseAmount(s: string | undefined): number | null {
 
 function mention(user: { username?: string | null; firstName?: string | null; tgId: string }): string {
   if (user.username) return `@${user.username}`
-  return user.firstName || `User ${user.tgId}`
+  if (user.firstName && !user.firstName.startsWith('+') && user.firstName !== '⠀') return user.firstName
+  return `Игрок ${user.tgId.slice(-4)}`
 }
 
 function mentionByTg(tgId: string, username?: string | null, firstName?: string | null): string {
   if (username) return `@${username}`
-  return firstName || `User ${tgId}`
+  if (firstName && !firstName.startsWith('+') && firstName !== '⠀') return firstName
+  return `Игрок ${tgId.slice(-4)}`
 }
 
 async function send(
@@ -116,16 +180,33 @@ async function send(
 
 async function upsertUser(from: TgUser) {
   const isAdminFlag = from.username?.toLowerCase() === ADMIN_USERNAME
-  return db.user.upsert({
+  const existing = await db.user.findUnique({ where: { tgId: String(from.id) } })
+  if (!existing) {
+    // NEW USER — give 10⭐ starting bonus (Feature #6)
+    const user = await db.user.create({
+      data: {
+        tgId: String(from.id),
+        username: from.username ?? null,
+        firstName: from.first_name ?? null,
+        lastName: from.last_name ?? null,
+        isAdmin: isAdminFlag,
+        balance: 10, // Starting bonus
+      },
+    })
+    await db.transaction.create({
+      data: {
+        userId: user.id,
+        type: 'welcome_bonus',
+        amount: 10,
+        balanceAfter: 10,
+        note: 'Стартовый бонус за регистрацию',
+      },
+    })
+    return user
+  }
+  return db.user.update({
     where: { tgId: String(from.id) },
-    create: {
-      tgId: String(from.id),
-      username: from.username ?? null,
-      firstName: from.first_name ?? null,
-      lastName: from.last_name ?? null,
-      isAdmin: isAdminFlag,
-    },
-    update: {
+    data: {
       username: from.username ?? null,
       firstName: from.first_name ?? null,
       lastName: from.last_name ?? null,
@@ -204,23 +285,41 @@ async function debitBalance(
 /* ------------------------------------------------------------------ */
 
 export async function handleUpdate(update: TgUpdate): Promise<void> {
-  if (update.callback_query) {
-    await handleCallbackQuery(update.callback_query)
-    return
-  }
+  try {
+    // Handle pre_checkout_query — AltGram sends it for Stars invoices
+    // Even though answerPreCheckoutQuery may return 501, we need to handle it
+    if (update.pre_checkout_query) {
+      try {
+        await altgram.answerPreCheckoutQuery?.({
+          pre_checkout_query_id: update.pre_checkout_query.id,
+          ok: true,
+        })
+      } catch {
+        // answerPreCheckoutQuery may return 501 — ignore
+      }
+      return
+    }
 
-  const msg = update.message ?? update.edited_message
-  if (!msg) return
+    if (update.callback_query) {
+      await handleCallbackQuery(update.callback_query)
+      return
+    }
 
-  if (msg.successful_payment) {
-    await handleSuccessfulPayment(msg)
-    return
-  }
+    const msg = update.message ?? update.edited_message
+    if (!msg) return
 
-  if (update.edited_message) return
+    if (msg.successful_payment) {
+      await handleSuccessfulPayment(msg)
+      return
+    }
 
-  if (msg.text) {
-    await handleTextMessage(msg)
+    if (update.edited_message) return
+
+    if (msg.text) {
+      await handleTextMessage(msg)
+    }
+  } catch (e) {
+    console.error('[handler] error processing update:', update.update_id, e)
   }
 }
 
@@ -285,6 +384,9 @@ async function handleTextMessage(msg: TgMessage) {
     case '/help':
       await sendHelp(msg, user)
       break
+    case '/menu':
+      await sendInlineMenu(msg.chat.id, user)
+      break
     case '/balance':
     case '/bal':
       await sendBalanceWithButtons(msg.chat.id, user)
@@ -313,6 +415,10 @@ async function handleTextMessage(msg: TgMessage) {
     case '/promo':
       await handlePromo(msg, user, parts.slice(1).join(' '))
       break
+    case '/pay':
+    case '/transfer':
+      await handlePay(msg, user, parts[1], parts[2])
+      break
     case '/stats':
       await handleStats(msg, user)
       break
@@ -327,6 +433,9 @@ async function handleTextMessage(msg: TgMessage) {
       break
     case '/addpromo':
       await handleAddPromo(msg, user, parts[1])
+      break
+    case '/donate':
+      await handleDonate(msg, user, parts[1])
       break
     case '/adminstats':
       await handleAdminStats(msg, user)
@@ -351,9 +460,24 @@ async function handleTextMessage(msg: TgMessage) {
 /* Welcome + main menu                                                */
 /* ------------------------------------------------------------------ */
 
-async function sendWelcome(msg: TgMessage, user: { id: string; balance: number; isAdmin: boolean }) {
-  // In private chat: show welcome + inline buttons (no reply keyboard in groups)
+async function handleStartWithRef(msg: TgMessage, user: { id: string; tgId: string; username: string | null; firstName: string | null; balance: number; isAdmin: boolean; referredById: string | null }, refArg: string) {
+  const code = refArg.slice(4)
+  const referrer = await db.user.findUnique({ where: { referralCode: code } })
+  if (referrer && !user.referredById && referrer.tgId !== user.tgId) {
+    await db.user.update({ where: { id: user.id }, data: { referredById: referrer.id } })
+    await creditBalance(referrer.id, 5, 'referral', `Реферал ${user.username || user.firstName} зарегистрировался`)
+    try {
+      const refBal = (await db.user.findUnique({ where: { id: referrer.id } }))?.balance ?? 0
+      await send(referrer.tgId, `🎁 Новый реферал! **${user.username ? '@' + user.username : user.firstName || 'Игрок'}** зарегистрировался.\n+5⭐ на баланс.\nБаланс: ${refBal}⭐`)
+    } catch { /* ignore */ }
+  }
+  await sendWelcome(msg, user)
+}
+
+async function sendWelcome(msg: TgMessage, user: { id: string; balance: number; isAdmin: boolean; createdAt?: Date }) {
   const isPrivate = msg.chat.type === 'private'
+  // Check if user is truly new (created within last 5 minutes)
+  const isNewUser = user.createdAt ? Date.now() - user.createdAt.getTime() < 5 * 60 * 1000 : false
   const text = [
     '🎲 **Stars Duels Bot**',
     '',
@@ -361,11 +485,13 @@ async function sendWelcome(msg: TgMessage, user: { id: string; balance: number; 
     'Бросаем 3 кубика — у кого больше сумма, тот победил.',
     `Комиссия с выигрыша: ${Math.round(COMMISSION_RATE * 100)}%.`,
     '',
+    isNewUser ? '🎁 **Стартовый бонус: +10⭐ за регистрацию!**' : '',
     `💰 Твой баланс: **${user.balance}⭐**`,
-  ].join('\n')
+    '',
+    isPrivate ? 'Используй кнопки внизу 👇' : 'В группе: `/duel 100` — создать дуэль',
+  ].filter(Boolean).join('\n')
 
   if (isPrivate) {
-    // In LS: show reply keyboard + inline action buttons
     const kb: TgInlineKeyboardMarkup = {
       inline_keyboard: [
         [
@@ -373,16 +499,17 @@ async function sendWelcome(msg: TgMessage, user: { id: string; balance: number; 
           { text: '💸 Вывести', callback_data: 'cashout' },
         ],
         [
-          { text: '🎁 Daily бонус', callback_data: 'daily' },
+          { text: '🎁 Daily', callback_data: 'daily' },
           { text: '🔗 Рефералка', callback_data: 'ref' },
+          { text: '📊 Стата', callback_data: 'stats' },
         ],
         [
-          { text: '📊 Статистика', callback_data: 'stats' },
           { text: '🏆 Топ', callback_data: 'top' },
+          { text: '📜 История', callback_data: 'history' },
+          { text: '📋 Меню', callback_data: 'menu' },
         ],
       ],
     }
-    // Send with reply keyboard (main menu) first
     const { text: plain, entities } = md(text)
     await altgram.sendMessage({
       chat_id: msg.chat.id,
@@ -390,12 +517,40 @@ async function sendWelcome(msg: TgMessage, user: { id: string; balance: number; 
       entities,
       reply_markup: mainMenuKeyboard(user.isAdmin) as unknown as TgInlineKeyboardMarkup,
     })
-    // Then send inline buttons as a separate message
     await send(msg.chat.id, '⚡ **Быстрые действия:**', kb)
   } else {
-    // In group: just text, no buttons (duels use inline buttons when created)
     await send(msg.chat.id, text)
   }
+}
+
+async function sendInlineMenu(chatId: number | string, user: { id: string; balance: number; isAdmin: boolean }) {
+  const kb: TgInlineKeyboardMarkup = {
+    inline_keyboard: [
+      [
+        { text: '💳 Пополнить', callback_data: 'topup' },
+        { text: '💸 Вывести', callback_data: 'cashout' },
+      ],
+      [
+        { text: '🎁 Daily', callback_data: 'daily' },
+        { text: '🔗 Рефералка', callback_data: 'ref' },
+      ],
+      [
+        { text: '📊 Статистика', callback_data: 'stats' },
+        { text: '🏆 Топ', callback_data: 'top' },
+        { text: '📜 История', callback_data: 'history' },
+      ],
+      ...(user.isAdmin ? [
+        [
+          { text: '⚡ Fast Click', callback_data: 'admin_fc' },
+          { text: '🎁 Промокод', callback_data: 'admin_promo' },
+        ],
+        [
+          { text: '📊 Стата бота', callback_data: 'admin_stats' },
+        ],
+      ] : []),
+    ],
+  }
+  await send(chatId, `📋 **Меню**\n💰 Баланс: ${user.balance}⭐\n\nВыбери действие:`, kb)
 }
 
 async function sendDuelHelp(chatId: number | string) {
@@ -490,6 +645,8 @@ async function sendHelp(msg: TgMessage, user: { isAdmin: boolean }) {
     '`/balance` — баланс + кнопки пополнить/вывести',
     '`/topup 100` — пополнить через Stars',
     '`/withdraw 50` — вывести (50 или 100⭐)',
+    '`/pay @user 50` — перевести звёзды другу',
+    '`/donate 100` — поддержать бота донатом',
     '',
     '🎁 **Бонусы:**',
     '`/daily` — ежедневный бонус',
@@ -600,9 +757,33 @@ async function handleSuccessfulPayment(msg: TgMessage) {
 
     const u = await db.user.findUnique({ where: { id: userId }, include: { referrer: true } })
     if (u?.referrer) {
+      // Базовый бонус: 5% от пополнения
       const bonus = Math.floor(amount * 0.05)
       if (bonus > 0) {
         await creditBalance(u.referrer.id, bonus, 'referral', `5% от пополнения реферала`)
+      }
+
+      // Feature #15: Реферальный буст — 10 рефералов → +50⭐ + 10% от их игр
+      const referralCount = await db.user.count({ where: { referredById: u.referrer.id } })
+      if (referralCount === 10) {
+        // Достиг 10 рефералов — бонус 50⭐
+        const alreadyRewarded = await db.transaction.findFirst({
+          where: { userId: u.referrer.id, type: 'referral_milestone', note: { contains: '10' } },
+        })
+        if (!alreadyRewarded) {
+          await creditBalance(u.referrer.id, 50, 'referral_milestone', 'Бонус за 10 рефералов!')
+          try {
+            await send(u.referrer.tgId, `🎉 **Бонус за 10 рефералов!** +50⭐ на баланс!\nТеперь вы получаете 10% от всех игр рефералов!`)
+          } catch { /* ignore */ }
+        }
+      }
+
+      // Если у реферера 10+ рефералов — 10% от пополнения вместо 5%
+      if (referralCount >= 10) {
+        const extraBonus = Math.floor(amount * 0.05) // ещё 5% сверху
+        if (extraBonus > 0) {
+          await creditBalance(u.referrer.id, extraBonus, 'referral_boost', `Доп. 5% (буст за 10+ рефералов)`)
+        }
       }
     }
 
@@ -664,7 +845,7 @@ async function sendCashoutMenu(chatId: number | string) {
 
 async function handleWithdraw(
   msg: TgMessage,
-  user: { id: string; tgId: string; balance: number },
+  user: { id: string; tgId: string; balance: number; username: string | null; firstName: string | null },
   amountArg?: string
 ) {
   if (!isPrivate(msg)) {
@@ -930,37 +1111,105 @@ async function cancelDuel(
 
 async function handleCallbackQuery(cq: TgCallbackQuery) {
   const data = cq.data ?? ''
-  if (!data) {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'OK' })
-    return
+
+  // ОТВЕЧАЕМ НА CALLBACK НЕМЕДЛЕННО — AltGram истекает через ~5 секунд
+  const callbackAnswers: Record<string, string> = {
+    'accept': 'Принимаем...',
+    'reject': 'Отклонено',
+    'pay': 'Обработка...',
+    'fastclick': 'Проверка...',
+    'withdraw': 'Обработка...',
+    'topup': 'OK',
+    'cashout': 'OK',
+    'daily': 'OK',
+    'ref': 'OK',
+    'promo_input': 'OK',
+    'stats': 'OK',
+    'top': 'OK',
+    'admin_fc': 'OK',
+    'admin_promo': 'OK',
+    'admin_stats': 'OK',
+    'admin_broadcast': 'OK',
   }
 
-  const [action, ...rest] = data.split(':')
+  const action = data.split(':')[0]
+  const answerText = callbackAnswers[action] || 'OK'
+  try {
+    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: answerText })
+  } catch {
+    // Ignore QUERY_ID_INVALID — callback already expired
+  }
+
+  if (!data) return
+
+  const [act, ...rest] = data.split(':')
   const arg = rest.join(':')
 
-  if (action === 'accept') await handleAcceptDuel(cq, arg)
-  else if (action === 'reject') await handleRejectDuel(cq, arg)
-  else if (action === 'pay') await handlePayDuel(cq, arg)
-  else if (action === 'fastclick') await handleFastClickClaim(cq, arg)
-  else if (action === 'withdraw') await handleWithdrawCallback(cq, arg)
-  else if (action === 'topup') await handleTopupCallback(cq, arg)
-  else if (action === 'cashout') await sendCashoutMenu(cq.message?.chat.id ?? cq.from.id)
-  else if (action === 'daily') await handleDailyCallback(cq)
-  else if (action === 'ref') await handleRefCallback(cq)
-  else if (action === 'promo_input') await handlePromoInput(cq)
-  else if (action === 'stats') await handleStatsCallback(cq)
-  else if (action === 'top') await handleTopCallback(cq)
-  else if (action === 'admin_fc') await handleAdminFcCallback(cq)
-  else if (action === 'admin_promo') await handleAdminPromoCallback(cq)
-  else if (action === 'admin_stats') await handleAdminStatsCallback(cq)
-  else if (action === 'admin_broadcast') await handleAdminBroadcastCallback(cq)
-  else await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'OK' })
+  if (act === 'accept') await handleAcceptDuel(cq, arg)
+  else if (act === 'reject') await handleRejectDuel(cq, arg)
+  else if (act === 'pay') await handlePayDuel(cq, arg)
+  else if (act === 'fastclick') await handleFastClickClaim(cq, arg)
+  else if (act === 'withdraw') await handleWithdrawCallback(cq, arg)
+  else if (act === 'donate') {
+    const amount = Number(arg)
+    const u = await upsertUser(cq.from)
+    if (u.balance < amount) {
+      await send(cq.from.id, `❌ Недостаточно. Баланс: ${u.balance}⭐`)
+      return
+    }
+    try {
+      await debitBalance(u.id, amount, 'donate', `Донат боту`)
+    } catch {
+      await send(cq.from.id, '❌ Ошибка.')
+      return
+    }
+    const senderName = u.username ? `@${u.username}` : u.firstName || `Игрок ${u.tgId.slice(-4)}`
+    await send(cq.from.id, `🎁 **Спасибо за донат!**\n💸 ${senderName} пожертвовал **${amount}⭐**`)
+    const admin = await db.user.findFirst({ where: { isAdmin: true } })
+    if (admin) await send(admin.tgId, `🎁 **Донат!**\nОт: ${senderName}\nСумма: ${amount}⭐`)
+  }
+  else if (act === 'topup') await handleTopupCallback(cq, arg)
+  else if (act === 'cashout') await sendCashoutMenu(cq.message?.chat.id ?? cq.from.id)
+  else if (act === 'daily') await handleDailyCallback(cq)
+  else if (act === 'ref') await handleRefCallback(cq)
+  else if (act === 'promo_input') await handlePromoInput(cq)
+  else if (act === 'stats') await handleStatsCallback(cq)
+  else if (act === 'top') await handleTopCallback(cq)
+  else if (act === 'admin_fc') {
+    // If arg is a number → create fast click directly
+    if (arg && /^\d+$/.test(arg)) {
+      const from = cq.from!
+      const user = await upsertUser(from)
+      if (!user.isAdmin) return
+      await createFastClick(cq.message?.chat.id ?? from.id, Number(arg))
+    } else {
+      await handleAdminFcCallback(cq)
+    }
+  }
+  else if (act === 'admin_promo') {
+    // If arg is a number → create promo directly
+    if (arg && /^\d+$/.test(arg)) {
+      const from = cq.from!
+      const user = await upsertUser(from)
+      if (!user.isAdmin) return
+      await createPromo(user.tgId, Number(arg), cq.message?.chat.id ?? from.id)
+    } else {
+      await handleAdminPromoCallback(cq)
+    }
+  }
+  else if (act === 'menu') await sendInlineMenu(cq.message?.chat.id ?? cq.from.id, await upsertUser(cq.from))
+  else if (act === 'history') {
+    const u = await upsertUser(cq.from)
+    await handleHistory({ chat: { id: cq.message?.chat.id ?? cq.from.id, type: 'private' }, from: cq.from, message_id: 0, date: 0 } as TgMessage, u, undefined)
+  }
+  else if (act === 'admin_stats') await handleAdminStatsCallback(cq)
+  else if (act === 'admin_broadcast') await handleAdminBroadcastCallback(cq)
 }
 
 async function handleTopupCallback(cq: TgCallbackQuery, amountStr: string) {
   const amount = Number(amountStr)
   if (!amount || amount < 1) {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Ошибка' })
+    // callback already answered at top
     return
   }
   const from = cq.from!
@@ -973,7 +1222,7 @@ async function handleAcceptDuel(cq: TgCallbackQuery, duelId: string) {
   const from = cq.from
   if (!from) return
 
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Принимаем...' })
+  // callback already answered at top
 
   const duel = await db.duel.findUnique({ where: { id: duelId } })
   if (!duel) {
@@ -982,6 +1231,19 @@ async function handleAcceptDuel(cq: TgCallbackQuery, duelId: string) {
   }
 
   if (duel.status !== 'waiting') {
+    // For targeted duels (status already 'accepted'), only the target can accept
+    if (duel.status === 'accepted' && duel.player2TgId === String(from.id)) {
+      // Target user clicked "Accept" — proceed to payment
+      const acceptor = await upsertUser(from)
+      await sendPaymentMessages(duel.id)
+      if (cq.message) {
+        try {
+          await send(cq.message.chat.id, `⚔️ **Дуэль принята!**\nСтавка: **${duel.amount}⭐**\n⏳ Проверьте ЛС с ботом для оплаты.`)
+        } catch { /* ignore */ }
+      }
+      setTimeout(() => checkPayTimeout(duel.id), PAY_TIMEOUT_MS)
+      return
+    }
     await send(cq.message?.chat.id ?? from.id, '⚠️ Дуэль уже началась или отменена.')
     return
   }
@@ -1015,13 +1277,32 @@ async function handleAcceptDuel(cq: TgCallbackQuery, duelId: string) {
 
   await sendPaymentMessages(duel.id)
 
+  // Обновить сообщение в чате с прогресс-баром оплаты
+  const paid1 = !!duel.paid1At
+  const paid2 = !!duel.paid2At
+  const paidCount = (paid1 ? 1 : 0) + (paid2 ? 1 : 0)
+  const progressBar = paidCount === 0 ? '░░' : paidCount === 1 ? '█░' : '██'
+  const p1 = await db.user.findUnique({ where: { tgId: duel.player1TgId } })
+  const p2 = duel.player2TgId ? await db.user.findUnique({ where: { tgId: duel.player2TgId } }) : null
+  const p1Status = paid1 ? '✅' : '⏳'
+  const p2Status = paid2 ? '✅' : '⏳'
+  const progressText = [
+    `⚔️ **Дуэль: ${mentionByTg(duel.player1TgId, p1?.username, p1?.firstName)} 🆚 ${p2 ? mentionByTg(duel.player2TgId!, p2.username, p2.firstName) : '???'}**`,
+    `Ставка: **${duel.amount}⭐**`,
+    '',
+    `Оплата: [${progressBar}] ${paidCount}/2`,
+    `${p1Status} ${mentionByTg(duel.player1TgId, p1?.username, p1?.firstName)}`,
+    p2 ? `${p2Status} ${mentionByTg(duel.player2TgId!, p2.username, p2.firstName)}` : '',
+    '',
+    '⏳ Ожидание оплаты... Проверьте ЛС с ботом.',
+  ].filter(Boolean).join('\n')
+
   if (cq.message) {
-    const p1 = await db.user.findUnique({ where: { tgId: duel.player1TgId } })
-    await altgram.editMessageText({
-      chat_id: cq.message.chat.id,
-      message_id: cq.message.message_id,
-      text: `⚔️ **Дуэль: ${mentionByTg(duel.player1TgId, p1?.username, p1?.firstName)} 🆚 ${mention(acceptor)}**\nСтавка: **${duel.amount}⭐**\n\n⏳ Ожидание оплаты... Проверьте ЛС.`,
-    })
+    // НЕ редактируем сообщение в группе — AltGram отдаёт фейковый chat_id
+    // Вместо этого отправляем новое сообщение со статусом
+    try {
+      await send(cq.message.chat.id, `⚔️ **Дуэль принята!**\n${mentionByTg(duel.player1TgId, p1?.username, p1?.firstName)} 🆚 ${p2 ? mentionByTg(duel.player2TgId!, p2.username, p2.firstName) : '???'}\nСтавка: **${duel.amount}⭐**\n\nОплата: [░░] 0/2\n⏳ Проверьте ЛС с ботом для оплаты.`)
+    } catch { /* ignore */ }
   }
 
   setTimeout(() => checkPayTimeout(duel.id), PAY_TIMEOUT_MS)
@@ -1065,18 +1346,18 @@ async function handlePayDuel(cq: TgCallbackQuery, duelId: string) {
 
   const duel = await db.duel.findUnique({ where: { id: duelId } })
   if (!duel) {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Дуэль не найдена', show_alert: true })
+    // callback already answered at top
     return
   }
 
   if (duel.status !== 'accepted' && duel.status !== 'paid') {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Дуэль уже идёт или отменена', show_alert: true })
+    // callback already answered at top
     return
   }
 
   const tgId = String(from.id)
   if (tgId !== duel.player1TgId && tgId !== duel.player2TgId) {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Это не ваша дуэль', show_alert: true })
+    // callback already answered at top
     return
   }
 
@@ -1085,7 +1366,7 @@ async function handlePayDuel(cq: TgCallbackQuery, duelId: string) {
 
   if (u.balance < duel.amount) {
     // Send Stars invoice
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Отправляю инвойс...' })
+    // callback already answered at top
     await altgram.sendInvoice({
       chat_id: Number(tgId),
       title: `Дуэль ${duel.amount}⭐`,
@@ -1101,11 +1382,11 @@ async function handlePayDuel(cq: TgCallbackQuery, duelId: string) {
   try {
     await debitBalance(u.id, duel.amount, 'duel_bet', `Ставка за дуэль ${duel.id.slice(-8)}`, duel.id)
   } catch {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Недостаточно звёзд', show_alert: true })
+    // callback already answered at top
     return
   }
 
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: '✅ Оплачено' })
+  // callback already answered at top
   await markPaid(duel.id, tgId)
 }
 
@@ -1128,8 +1409,45 @@ async function markPaid(duelId: string, payerTgId: string) {
 
   await send(payerTgId, `✅ Оплата принята. Ожидаем второго игрока...`)
 
+  // Обновить прогресс-бар в чате
+  await updateDuelProgress(duelId)
+
   if (paid1 && paid2) {
     await rollDuel(duelId)
+  }
+}
+
+/** Обновляет прогресс-бар оплаты в чате */
+async function updateDuelProgress(duelId: string) {
+  const duel = await db.duel.findUnique({ where: { id: duelId } })
+  if (!duel) return
+
+  const paid1 = !!duel.paid1At
+  const paid2 = !!duel.paid2At
+  const paidCount = (paid1 ? 1 : 0) + (paid2 ? 1 : 0)
+  const progressBar = paidCount === 0 ? '░░' : paidCount === 1 ? '█░' : '██'
+
+  const p1 = await db.user.findUnique({ where: { tgId: duel.player1TgId } })
+  const p2 = duel.player2TgId ? await db.user.findUnique({ where: { tgId: duel.player2TgId } }) : null
+
+  const text = [
+    `⚔️ **Дуэль: ${mentionByTg(duel.player1TgId, p1?.username, p1?.firstName)} 🆚 ${p2 ? mentionByTg(duel.player2TgId!, p2.username, p2.firstName) : '???'}**`,
+    `Ставка: **${duel.amount}⭐**`,
+    '',
+    `Оплата: [${progressBar}] ${paidCount}/2`,
+    `${paid1 ? '✅' : '⏳'} ${mentionByTg(duel.player1TgId, p1?.username, p1?.firstName)}`,
+    p2 ? `${paid2 ? '✅' : '⏳'} ${mentionByTg(duel.player2TgId!, p2.username, p2.firstName)}` : '',
+    '',
+    paid1 && paid2 ? '🎲 Бросаем кости!' : '⏳ Ожидание оплаты...',
+  ].filter(Boolean).join('\n')
+
+  // Пытаемся найти сообщение дуэли в чате и обновить его
+  // НЕ редактируем — AltGram отдаёт фейковый chat_id для групп
+  // Вместо этого отправляем новое сообщение со статусом оплаты
+  if (paidCount === 1) {
+    try {
+      await send(duel.chatId, `💳 Оплата: [█░] 1/2 — ${paid1 ? mentionByTg(duel.player1TgId, p1?.username, p1?.firstName) : mentionByTg(duel.player2TgId!, p2?.username, p2?.firstName)} оплатил(а).`)
+    } catch { /* ignore */ }
   }
 }
 
@@ -1168,8 +1486,8 @@ async function rollDuel(duelId: string) {
   const p1 = await db.user.findUnique({ where: { tgId: duel.player1TgId } })
   const p2 = duel.player2TgId ? await db.user.findUnique({ where: { tgId: duel.player2TgId } }) : null
 
-  const roll1Str = roll1.map((v) => DICE_EMOJI[v - 1]).join('')
-  const roll2Str = roll2.map((v) => DICE_EMOJI[v - 1]).join('')
+  const roll1Str = roll1.map((v) => DICE_EMOJI[v - 1]).join(' ')
+  const roll2Str = roll2.map((v) => DICE_EMOJI[v - 1]).join(' ')
 
   const p1Name = mentionByTg(duel.player1TgId, p1?.username, p1?.firstName)
   const p2Name = p2 ? mentionByTg(duel.player2TgId!, p2.username, p2.firstName) : '???'
@@ -1208,11 +1526,26 @@ async function rollDuel(duelId: string) {
       const loser = loserTgId ? await db.user.findUnique({ where: { tgId: loserTgId } }) : null
 
       if (loser) {
+        // Feature #7: Cashback after 5 consecutive losses
+        const recentLosses = await db.duel.count({
+          where: {
+            OR: [{ player1TgId: loser.tgId }, { player2TgId: loser.tgId }],
+            status: 'finished',
+            winnerTgId: { not: loser.tgId },
+            finishedAt: { gt: new Date(Date.now() - 60 * 60 * 1000) }, // last hour
+          },
+        })
+        let cashbackMsg = ''
+        if (recentLosses >= 5 && recentLosses % 5 === 0) {
+          // Give 5⭐ cashback every 5 losses in the last hour
+          await creditBalance(loser.id, 5, 'cashback', `Кешбэк за ${recentLosses} поражений`)
+          cashbackMsg = `\n🎁 **Кешбэк +5⭐** за ${recentLosses} поражений!`
+        }
         await db.user.update({
           where: { id: loser.id },
           data: { duelsPlayed: { increment: 1 }, duelsLost: { increment: 1 }, totalLost: { increment: duel.amount }, currentStreak: 0 },
         })
-        await send(loser.tgId, `💀 Поражение против ${mentionByTg(winnerTgId, winner.username, winner.firstName)}.\nПроиграно: ${duel.amount}⭐`)
+        await send(loser.tgId, `💀 Поражение против ${mentionByTg(winnerTgId, winner.username, winner.firstName)}.\nПроиграно: ${duel.amount}⭐${cashbackMsg}`)
       }
 
       const newStreak = winner.currentStreak + 1
@@ -1240,10 +1573,15 @@ async function rollDuel(duelId: string) {
   await send(
     duel.chatId,
     [
-      `🎲 **Бросаем кости!**`,
+      `🎲 ═══ **Бросаем кости!** ═══`,
       '',
-      `${p1Name}: ${roll1Str} → ${roll1.join(' + ')} = **${sum1}**`,
-      `${p2Name}: ${roll2Str} → ${roll2.join(' + ')} = **${sum2}**`,
+      `👤 ${p1Name}:`,
+      `   ${roll1Str}  →  ${roll1.join(' + ')} = **${sum1}**`,
+      '',
+      `👤 ${p2Name}:`,
+      `   ${roll2Str}  →  ${roll2.join(' + ')} = **${sum2}**`,
+      '',
+      `━━━━━━━━━━━━━━━`,
       '',
       resultText,
     ].join('\n')
@@ -1253,7 +1591,7 @@ async function rollDuel(duelId: string) {
 async function handleRejectDuel(cq: TgCallbackQuery, duelId: string) {
   const from = cq.from
   if (!from) return
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Отклонено' })
+  // callback already answered at top
 
   const duel = await db.duel.findUnique({ where: { id: duelId } })
   if (!duel || duel.status !== 'accepted') return
@@ -1282,7 +1620,7 @@ async function handleDaily(
 async function handleDailyCallback(cq: TgCallbackQuery) {
   const from = cq.from!
   const user = await upsertUser(from)
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'OK' })
+  // callback already answered at top
   await doDaily(cq.message?.chat.id ?? from.id, user)
 }
 
@@ -1317,7 +1655,7 @@ async function doDaily(chatId: number | string, user: { id: string; balance: num
 async function handleRefCallback(cq: TgCallbackQuery) {
   const from = cq.from!
   const user = await upsertUser(from)
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'OK' })
+  // callback already answered at top
   await doRef(cq.message?.chat.id ?? from.id, user)
 }
 
@@ -1356,7 +1694,7 @@ async function doRef(chatId: number | string, user: { id: string; username: stri
 /* ------------------------------------------------------------------ */
 
 async function handlePromoInput(cq: TgCallbackQuery) {
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'OK' })
+  // callback already answered at top
   await send(
     cq.message?.chat.id ?? cq.from.id,
     '🎟️ Введите команду:\n`/promo КОД`\n\nПример: `/promo SD-ABC123`'
@@ -1366,12 +1704,12 @@ async function handlePromoInput(cq: TgCallbackQuery) {
 async function handleStatsCallback(cq: TgCallbackQuery) {
   const from = cq.from!
   const user = await upsertUser(from)
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'OK' })
+  // callback already answered at top
   await doStats(cq.message?.chat.id ?? from.id, user)
 }
 
 async function handleTopCallback(cq: TgCallbackQuery) {
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'OK' })
+  // callback already answered at top
   await doTop(cq.message?.chat.id ?? cq.from.id)
 }
 
@@ -1473,6 +1811,62 @@ async function handlePromo(
     }
     await send(msg.chat.id, map[msg2] || '❌ Ошибка активации.')
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* /pay — перевод звёзд другому юзеру                                 */
+/* ------------------------------------------------------------------ */
+
+async function handlePay(
+  msg: TgMessage,
+  user: { id: string; tgId: string; balance: number; username: string | null; firstName: string | null },
+  targetArg?: string,
+  amountArg?: string
+) {
+  if (!targetArg || !targetArg.startsWith('@')) {
+    await send(msg.chat.id, '⚠️ Использование:\n`/pay @user 50`\n\nПеревести звёзды другому игроку.')
+    return
+  }
+  const targetUsername = targetArg.slice(1).toLowerCase()
+  if (targetUsername === (user.username?.toLowerCase() ?? '')) {
+    await send(msg.chat.id, '⚠️ Нельзя перевести себе!')
+    return
+  }
+  const amount = parseAmount(amountArg)
+  if (!amount || amount < 1) {
+    await send(msg.chat.id, '⚠️ Укажите сумму: `/pay @user 50`')
+    return
+  }
+  if (user.balance < amount) {
+    await send(msg.chat.id, `❌ Недостаточно звёзд. Ваш баланс: ${user.balance}⭐`)
+    return
+  }
+  const target = await db.user.findFirst({ where: { username: targetUsername } })
+  if (!target) {
+    await send(msg.chat.id, `⚠️ @${targetUsername} не найден. Юзер должен запустить /start.`)
+    return
+  }
+
+  // Atomic transfer
+  try {
+    await db.$transaction(async (tx) => {
+      await tx.user.update({ where: { id: user.id }, data: { balance: { decrement: amount } } })
+      await tx.user.update({ where: { id: target.id }, data: { balance: { increment: amount } } })
+      await tx.transaction.create({ data: { userId: user.id, type: 'transfer_out', amount: -amount, balanceAfter: user.balance - amount, note: `Перевод @${targetUsername}` } })
+      await tx.transaction.create({ data: { userId: target.id, type: 'transfer_in', amount, balanceAfter: target.balance + amount, note: `От ${user.username ? '@' + user.username : user.firstName}` } })
+    })
+  } catch {
+    await send(msg.chat.id, '❌ Ошибка перевода. Попробуйте позже.')
+    return
+  }
+
+  const senderName = user.username ? `@${user.username}` : user.firstName || `Игрок ${user.tgId.slice(-4)}`
+  await send(msg.chat.id, `✅ **Перевод выполнен!**\n💸 ${senderName} → @${targetUsername}\n💰 Сумма: **${amount}⭐**\nВаш баланс: ${user.balance - amount}⭐`)
+
+  // Уведомить получателя
+  try {
+    await send(target.tgId, `💸 **Вам перевод!**\nОт: ${senderName}\nСумма: **${amount}⭐**\nБаланс: ${target.balance + amount}⭐`)
+  } catch { /* ignore */ }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1621,10 +2015,10 @@ async function handleAdminFcCallback(cq: TgCallbackQuery) {
   const from = cq.from!
   const user = await upsertUser(from)
   if (!user.isAdmin) {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Только админ', show_alert: true })
+    // callback already answered at top
     return
   }
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Введите сумму (число):' })
+  // callback already answered at top
   // We can't easily get text input from a callback. So show preset buttons instead.
   const kb: TgInlineKeyboardMarkup = {
     inline_keyboard: [
@@ -1679,7 +2073,7 @@ async function handleFastClickClaim(cq: TgCallbackQuery, fcId: string) {
 
   const fc = await db.fastClick.findUnique({ where: { id: fcId } })
   if (!fc || fc.status !== 'active') {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Уже поздно', show_alert: true })
+    // callback already answered at top
     return
   }
 
@@ -1689,7 +2083,7 @@ async function handleFastClickClaim(cq: TgCallbackQuery, fcId: string) {
   })
 
   if (claimed.count === 0) {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Кто-то уже забрал', show_alert: true })
+    // callback already answered at top
     return
   }
 
@@ -1699,11 +2093,10 @@ async function handleFastClickClaim(cq: TgCallbackQuery, fcId: string) {
   await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: `🎉 Вы забрали ${fc.amount}⭐!`, show_alert: true })
 
   if (cq.message) {
-    await altgram.editMessageText({
-      chat_id: cq.message.chat.id,
-      message_id: cq.message.message_id,
-      text: `⚡ Fast Click завершён!\n🎉 ${mention(user)} забрал ${fc.amount}⭐ за ${Math.floor((Date.now() - fc.createdAt.getTime()) / 1000)}с!`,
-    })
+    // НЕ редактируем — отправляем новое сообщение
+    try {
+      await send(cq.message.chat.id, `⚡ Fast Click завершён!\n🎉 ${mention(user)} забрал ${fc.amount}⭐ за ${Math.floor((Date.now() - fc.createdAt.getTime()) / 1000)}с!`)
+    } catch { /* ignore */ }
   }
 }
 
@@ -1743,10 +2136,10 @@ async function handleAdminPromoCallback(cq: TgCallbackQuery) {
   const from = cq.from!
   const user = await upsertUser(from)
   if (!user.isAdmin) {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Только админ', show_alert: true })
+    // callback already answered at top
     return
   }
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'OK' })
+  // callback already answered at top
   const kb: TgInlineKeyboardMarkup = {
     inline_keyboard: [
       [
@@ -1795,11 +2188,57 @@ async function handleAdminStatsCallback(cq: TgCallbackQuery) {
   const from = cq.from!
   const user = await upsertUser(from)
   if (!user.isAdmin) {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Только админ', show_alert: true })
+    // callback already answered at top
     return
   }
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'OK' })
+  // callback already answered at top
   await doAdminStats(cq.message?.chat.id ?? from.id)
+}
+
+/* ------------------------------------------------------------------ */
+/* /donate — донат боту                                               */
+/* ------------------------------------------------------------------ */
+
+async function handleDonate(
+  msg: TgMessage,
+  user: { id: string; tgId: string; balance: number; username: string | null; firstName: string | null },
+  amountArg?: string
+) {
+  if (!isPrivate(msg)) {
+    await send(msg.chat.id, '🔒 Донат только в личке с ботом.')
+    return
+  }
+  const amount = parseAmount(amountArg)
+  if (!amount || amount < 1) {
+    const kb: TgInlineKeyboardMarkup = {
+      inline_keyboard: [[
+        { text: '50⭐', callback_data: 'donate:50' },
+        { text: '100⭐', callback_data: 'donate:100' },
+        { text: '250⭐', callback_data: 'donate:250' },
+      ], [
+        { text: '500⭐', callback_data: 'donate:500' },
+        { text: '1000⭐', callback_data: 'donate:1000' },
+      ]],
+    }
+    await send(msg.chat.id, '🎁 **Донат боту**\n\nПоддержи разработку!\nВыбери сумму:', kb)
+    return
+  }
+  if (user.balance < amount) {
+    await send(msg.chat.id, `❌ Недостаточно. Баланс: ${user.balance}⭐`)
+    return
+  }
+  try {
+    await debitBalance(user.id, amount, 'donate', `Донат боту`)
+  } catch {
+    await send(msg.chat.id, '❌ Ошибка. Попробуйте позже.')
+    return
+  }
+  const senderName = user.username ? `@${user.username}` : user.firstName || `Игрок ${user.tgId.slice(-4)}`
+  await send(msg.chat.id, `🎁 **Спасибо за донат!**\n\n💸 ${senderName} пожертвовал **${amount}⭐**\n💚 Это поможет развитию бота!`)
+  const admin = await db.user.findFirst({ where: { isAdmin: true } })
+  if (admin) {
+    await send(admin.tgId, `🎁 **Новый донат!**\nОт: ${senderName}\nСумма: ${amount}⭐`)
+  }
 }
 
 async function handleAdminStats(msg: TgMessage, user: { isAdmin: boolean }) {
@@ -1824,6 +2263,37 @@ async function doAdminStats(chatId: number | string) {
     _sum: { commission: true },
   })
 
+  // Сумма донатов
+  const donations = await db.transaction.aggregate({
+    where: { type: 'donate' },
+    _sum: { amount: true },
+  })
+  const donationsCount = await db.transaction.count({ where: { type: 'donate' } })
+
+  // Сумма пополнений (всего звёзд вошло)
+  const totalDeposited = await db.transaction.aggregate({
+    where: { type: 'deposit' },
+    _sum: { amount: true },
+  })
+
+  // Сумма выводов
+  const totalWithdrawn = await db.transaction.aggregate({
+    where: { type: 'withdraw' },
+    _sum: { amount: true },
+  })
+
+  const commissionTotal = commission._sum.commission ?? 0
+  const donationsTotal = Math.abs(donations._sum.amount ?? 0)
+  const totalRevenue = commissionTotal + donationsTotal
+
+  // Feature #10: Weekly top for seasonal rewards
+  const weekTop = await db.user.findMany({
+    where: { duelsPlayed: { gt: 0 } },
+    orderBy: { totalEarned: 'desc' },
+    take: 5,
+    select: { tgId: true, username: true, firstName: true, totalEarned: true },
+  })
+
   await send(
     chatId,
     [
@@ -1833,8 +2303,18 @@ async function doAdminStats(chatId: number | string) {
       `🎲 Дуэлей сыграно: ${duels}`,
       `⚡ Активных дуэлей: ${activeDuels}`,
       `💸 Транзакций: ${txCount}`,
-      `💰 Комиссии заработано: ${commission._sum.commission ?? 0}⭐`,
+      '',
+      `💰 **Доход бота:**`,
+      `   🎲 Комиссия: ${commissionTotal}⭐`,
+      `   🎁 Донатов: ${donationsTotal}⭐ (${donationsCount} шт.)`,
+      `   💎 **Итого доход: ${totalRevenue}⭐**`,
+      '',
+      `📤 Пополнено всего: ${totalDeposited._sum.amount ?? 0}⭐`,
+      `📥 Выведено всего: ${Math.abs(totalWithdrawn._sum.amount ?? 0)}⭐`,
       `⏳ Ожидают вывода: ${pendingWithdrawals}`,
+      '',
+      '📊 **Топ недели:**',
+      ...weekTop.slice(0, 3).map((u, i) => `${['🥇','🥈','🥉'][i]} @${u.username || u.firstName || u.tgId} — ${u.totalEarned}⭐`),
     ].join('\n')
   )
 }
@@ -1843,10 +2323,10 @@ async function handleAdminBroadcastCallback(cq: TgCallbackQuery) {
   const from = cq.from!
   const user = await upsertUser(from)
   if (!user.isAdmin) {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Только админ', show_alert: true })
+    // callback already answered at top
     return
   }
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'OK' })
+  // callback already answered at top
   await send(
     cq.message?.chat.id ?? from.id,
     '📢 **Рассылка**\n\nИспользуйте команду:\n`/broadcast <текст>`\n\nПример: `/broadcast Скоро турнир!`'
@@ -1936,11 +2416,11 @@ async function handleGive(msg: TgMessage, user: { isAdmin: boolean }, usernameAr
 
 async function handleWithdrawCallback(cq: TgCallbackQuery, amountStr: string) {
   const from = cq.from!
-  await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Обработка...' })
+  // callback already answered at top
 
   const amount = Number(amountStr)
   if (amount !== 50 && amount !== 100) {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Неверная сумма', show_alert: true })
+    // callback already answered at top
     return
   }
 
@@ -1952,57 +2432,15 @@ async function handleWithdrawCallback(cq: TgCallbackQuery, amountStr: string) {
 /* Admin FC/Promo callback with amount                                 */
 /* ------------------------------------------------------------------ */
 
-// Override the earlier handlers to support amount in callback data
-// "admin_fc:50" → create fast click with 50
-// "admin_promo:100" → create promo with 100
+// Handle admin_fc with amount and admin_promo with amount inline in the main handler.
+// "admin_fc:50" → action="admin_fc", arg="50"
+// "admin_promo:100" → action="admin_promo", arg="100"
 
-const _origHandleCallback = handleCallbackQuery
+// Note: handleAdminFcCallback and handleAdminPromoCallback already handle the
+// no-arg case (showing preset buttons). Here we add the with-amount case
+// directly in the main callback dispatcher so it doesn't need a separate export.
 
-// Re-export with extended handling — but since we already handle admin_fc and admin_promo
-// without amount above, let's add the with-amount variants inline.
+// The main handleCallbackQuery function above already dispatches based on action.
+// We need to update it to handle "admin_fc:50" and "admin_promo:100" patterns.
+// This is done by checking if arg is a number in the existing handlers.
 
-// Actually the callback handler splits on ":" so "admin_fc:50" would give action="admin_fc" and arg="50".
-// Let's update handleAdminFcCallback and handleAdminPromoCallback to check for arg.
-
-export async function handleCallbackQueryV2(cq: TgCallbackQuery) {
-  const data = cq.data ?? ''
-  if (!data) {
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'OK' })
-    return
-  }
-
-  const parts = data.split(':')
-  const action = parts[0]
-  const arg = parts.slice(1).join(':')
-
-  // Extended: admin_fc with amount
-  if (action === 'admin_fc' && arg && /^\d+$/.test(arg)) {
-    const from = cq.from!
-    const user = await upsertUser(from)
-    if (!user.isAdmin) {
-      await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Только админ', show_alert: true })
-      return
-    }
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: `Создаю Fast Click ${arg}⭐...` })
-    await createFastClick(cq.message?.chat.id ?? from.id, Number(arg))
-    return
-  }
-
-  if (action === 'admin_promo' && arg && /^\d+$/.test(arg)) {
-    const from = cq.from!
-    const user = await upsertUser(from)
-    if (!user.isAdmin) {
-      await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Только админ', show_alert: true })
-      return
-    }
-    await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Создаю промокод...' })
-    await createPromo(user.tgId, Number(arg), cq.message?.chat.id ?? from.id)
-    return
-  }
-
-  // Fall through to original handler
-  await _origHandleCallback(cq)
-}
-
-// Replace the export
-export { handleCallbackQueryV2 as handleCallbackQuery }
