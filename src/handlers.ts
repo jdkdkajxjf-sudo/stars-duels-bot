@@ -2309,6 +2309,7 @@ async function handleAdminStatsCallback(cq: TgCallbackQuery) {
 /* /sendgift — админ: отправить gift юзеру                            */
 /* /sendgift @user <amount> <count>                                    */
 /* /sendgift @user 1000 5 — отправить 5 gifts по 1000⭐               */
+/* /sendgift <tgId> 1000 5 — отправить по tgId                       */
 /* ------------------------------------------------------------------ */
 
 async function handleSendGift(
@@ -2321,16 +2322,17 @@ async function handleSendGift(
     return
   }
 
-  const targetArg = args[0]
+  const targetArg = args[0] ?? ''
   const amountArg = args[1]
   const countArg = args[2] || '1'
 
-  if (!targetArg || !targetArg.startsWith('@')) {
-    await send(msg.chat.id, '⚠️ Использование:\n`/sendgift @user 1000 5`\n\nОтправить gifts юзеру.\nДоступные цены: 25, 50, 75, 100, 500, 1000⭐')
+  // Убираем @ если есть — принимаем оба формата: @user и user
+  const rawTarget = targetArg.replace(/^@/, '').trim()
+  if (!rawTarget) {
+    await send(msg.chat.id, '⚠️ Использование:\n`/sendgift @user 1000 5`\n\nОтправить gifts юзеру.\nДоступные цены: 15, 25, 50, 75, 100, 500, 1000⭐\n\nМожно указать @username или tgId.')
     return
   }
 
-  const targetUsername = targetArg.slice(1).toLowerCase()
   const amount = parseAmount(amountArg)
   const count = Math.min(Math.max(Number(countArg) || 1, 1), 50)
 
@@ -2345,14 +2347,45 @@ async function handleSendGift(
     return
   }
 
-  // Найти юзера
-  const target = await db.user.findFirst({ where: { username: targetUsername } })
+  // Поиск юзера: пробуем по tgId (если число) или по username (lowercase)
+  let target: { id: string; tgId: string; username: string | null; firstName: string | null } | null = null
+
+  // Сначала пробуем как tgId (число)
+  if (/^\d+$/.test(rawTarget)) {
+    target = await db.user.findUnique({
+      where: { tgId: rawTarget },
+      select: { id: true, tgId: true, username: true, firstName: true }
+    })
+  }
+
+  // Потом по username (всегда lowercase — миграция normalizeUsernames() приводит к lowercase)
   if (!target) {
-    await send(msg.chat.id, `⚠️ @${targetUsername} не найден. Юзер должен запустить /start.`)
+    const searchUsername = rawTarget.toLowerCase()
+    target = await db.user.findFirst({
+      where: { username: searchUsername },
+      select: { id: true, tgId: true, username: true, firstName: true }
+    })
+  }
+
+  // Если не найден — покажем список всех юзеров для диагностики
+  if (!target) {
+    const allUsers = await db.user.findMany({
+      select: { username: true, tgId: true, firstName: true },
+      where: { username: { not: null } },
+    })
+    const list = allUsers
+      .map(u => `• @${u.username ?? '?'} (${u.tgId})`)
+      .slice(0, 20)
+      .join('\n')
+    await send(
+      msg.chat.id,
+      `⚠️ Юзер \`${rawTarget}\` не найден.\n\nЮзеры в БД:\n${list}\n\nЮзер должен запустить /start.`
+    )
     return
   }
 
-  await send(msg.chat.id, `⏳ Отправляю ${count} gifts по ${amount}⭐ юзеру @${targetUsername}...`)
+  const displayName = target.username ? `@${target.username}` : `tg:${target.tgId}`
+  await send(msg.chat.id, `⏳ Отправляю ${count} gifts по ${amount}⭐ юзеру ${displayName}...`)
 
   const { sent, failed } = await sendGiftToUser(target.tgId, amount, count)
 
@@ -2361,7 +2394,7 @@ async function handleSendGift(
     [
       `🎁 **Результат отправки gifts:**`,
       '',
-      `👤 Юзер: @${targetUsername}`,
+      `👤 Юзер: ${displayName}`,
       `💰 Цена: ${amount}⭐ за gift`,
       `📦 Кол-во: ${count}`,
       '',
