@@ -340,6 +340,17 @@ export async function handleUpdate(update: TgUpdate): Promise<void> {
     }
   } catch (e) {
     console.error('[handler] error processing update:', update.update_id, e)
+    // ВАЖНО: сообщаем пользователю что команда упала — иначе бот молчит и юзер не понимает
+    try {
+      const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id
+      if (chatId) {
+        const errMsg = e instanceof Error ? e.message : String(e)
+        await altgram.sendMessage({
+          chat_id: chatId,
+          text: `❌ Внутренняя ошибка команды.\n\nДетали: ${errMsg.slice(0, 300)}`,
+        })
+      }
+    } catch { /* ignore — не можем даже отправить */ }
   }
 }
 
@@ -472,11 +483,42 @@ async function handleTextMessage(msg: TgMessage) {
     case '/broadcast':
       await handleBroadcast(msg, user, parts.slice(1).join(' '))
       break
+    case '/listusers':
+      await handleListUsers(msg, user)
+      break
     default:
       if (cmd.startsWith('/')) {
         await send(msg.chat.id, '🤔 Неизвестная команда. /help — список команд.')
       }
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* /listusers — админ: показать всех юзеров в БД (для диагностики)     */
+/* ------------------------------------------------------------------ */
+
+async function handleListUsers(
+  msg: TgMessage,
+  user: { isAdmin: boolean }
+) {
+  if (!user.isAdmin) {
+    await send(msg.chat.id, '🚫 Только админ.')
+    return
+  }
+  const users = await db.user.findMany({
+    select: { username: true, tgId: true, firstName: true, balance: true, isAdmin: true, createdAt: true },
+    orderBy: { createdAt: 'asc' },
+  })
+  const lines = users.map(u => {
+    const name = u.username ? `@${u.username}` : (u.firstName || '(no name)')
+    const adminTag = u.isAdmin ? ' 👑admin' : ''
+    return `• ${name} — tgId: ${u.tgId} — ${u.balance}⭐${adminTag}`
+  })
+  await send(
+    msg.chat.id,
+    `📋 **Юзеры в БД (${users.length}):**\n\n${lines.join('\n')}\n\nИспользуйте:\n` +
+    `\`/sendgift <username> <amount> <count>\` — для отправки gift`
+  )
 }
 
 /* ------------------------------------------------------------------ */
