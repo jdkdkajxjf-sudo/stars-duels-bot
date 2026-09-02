@@ -133,14 +133,13 @@ async function main() {
       const data = await res.json() as { ok: boolean; result?: TgUpdate[]; error_code?: number; description?: string }
 
       if (!data.ok) {
-        console.error('[poll] getUpdates failed:', data.error_code, data.description)
-        consecutiveErrors++
-        if (consecutiveErrors > 5) {
-          // Too many errors — maybe AltGram is down, wait longer
-          console.log('[poll] Too many errors, waiting 10s...')
-          await sleep(10_000)
-          consecutiveErrors = 0
+        const errorCode = data.error_code || 0
+        if (errorCode === 409) {
+          // 409 Conflict — другой процесс тоже поллит. Ждём 60 сек.
+          console.log('[poll] 409 Conflict — another instance running. Waiting 60s...')
+          await sleep(60_000)
         } else {
+          console.error('[poll] getUpdates failed:', data.error_code, data.description)
           await sleep(RETRY_MS)
         }
         continue
@@ -165,9 +164,15 @@ async function main() {
         console.log(`[poll] processed ${updates.length} update(s), offset=${offsetStr}, total=${handled}`)
       }
     } catch (e) {
-      console.error('[poll] unexpected error:', e)
-      consecutiveErrors++
-      await sleep(RETRY_MS * 2)
+      // ConnectionRefused / ECONNRESET — AltGram сервер недоступен
+      const errorMsg = String(e)
+      if (errorMsg.includes('ConnectionRefused') || errorMsg.includes('ECONNRESET') || errorMsg.includes('Unable to connect')) {
+        console.error('[poll] AltGram server unreachable, waiting 15s...')
+        await sleep(15_000)
+      } else {
+        console.error('[poll] unexpected error:', e)
+        await sleep(RETRY_MS * 2)
+      }
     }
   }
 }
