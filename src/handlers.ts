@@ -74,6 +74,32 @@ export async function recoverStuckDuels() {
     console.error('[recovery] Error:', e)
   }
 }
+
+/**
+ * МИГРАЦИЯ — приводим все username к lowercase.
+ * Вызывается один раз при старте бота.
+ */
+export async function normalizeUsernames() {
+  try {
+    const users = await db.user.findMany({
+      where: { username: { not: null } },
+      select: { id: true, username: true },
+    })
+    let fixed = 0
+    for (const u of users) {
+      if (u.username && u.username !== u.username.toLowerCase()) {
+        await db.user.update({
+          where: { id: u.id },
+          data: { username: u.username.toLowerCase() },
+        })
+        fixed++
+      }
+    }
+    console.log(`[migration] Normalized ${fixed} usernames to lowercase (total: ${users.length})`)
+  } catch (e) {
+    console.error('[migration] Error normalizing usernames:', e)
+  }
+}
 const NEW_USER_MAX_BET = 100
 const NEW_USER_HOURS = 24
 const DUEL_COOLDOWN_MS = 30_000
@@ -186,7 +212,7 @@ async function upsertUser(from: TgUser) {
     const user = await db.user.create({
       data: {
         tgId: String(from.id),
-        username: from.username ?? null,
+        username: from.username?.toLowerCase() ?? null,
         firstName: from.first_name ?? null,
         lastName: from.last_name ?? null,
         isAdmin: isAdminFlag,
@@ -207,7 +233,7 @@ async function upsertUser(from: TgUser) {
   return db.user.update({
     where: { tgId: String(from.id) },
     data: {
-      username: from.username ?? null,
+      username: from.username?.toLowerCase() ?? null,
       firstName: from.first_name ?? null,
       lastName: from.last_name ?? null,
       ...(isAdminFlag ? { isAdmin: true } : {}),
@@ -1078,7 +1104,11 @@ async function handleDuelCommand(
   })
 
   if (targetUsername) {
-    const target = await db.user.findFirst({ where: { username: targetUsername } })
+    // Case-insensitive search — username в БД может быть "Crash" а ищем "crash"
+    const target = await db.user.findFirst({
+
+      where: { username: targetUsername }
+    })
     if (!target) {
       await send(msg.chat.id, `⚠️ @${targetUsername} не найден. Юзер должен запустить /start.`)
       await db.duel.update({ where: { id: duel.id }, data: { status: 'cancelled' } })
@@ -2525,7 +2555,8 @@ async function handleBan(msg: TgMessage, user: { isAdmin: boolean }, usernameArg
     return
   }
   const username = usernameArg.slice(1).toLowerCase()
-  const target = await db.user.findFirst({ where: { username } })
+
+  const target = await db.user.findFirst({ where: { username: username } })
   if (!target) {
     await send(msg.chat.id, `⚠️ @${username} не найден.`)
     return
@@ -2549,7 +2580,8 @@ async function handleGive(msg: TgMessage, user: { isAdmin: boolean }, usernameAr
     return
   }
   const username = usernameArg.slice(1).toLowerCase()
-  const target = await db.user.findFirst({ where: { username } })
+
+  const target = await db.user.findFirst({ where: { username: username } })
   if (!target) {
     await send(msg.chat.id, `⚠️ @${username} не найден.`)
     return

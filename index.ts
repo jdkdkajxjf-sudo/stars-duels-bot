@@ -5,7 +5,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { altgram } from './src/altgram'
-import { handleUpdate, recoverStuckDuels } from './src/handlers'
+import { handleUpdate, recoverStuckDuels, normalizeUsernames } from './src/handlers'
 import type { TgUpdate, TgUser } from './src/types'
 
 const PORT = Number(process.env.PORT) || 3006
@@ -105,6 +105,9 @@ async function main() {
 
   // ЗАЩИТА ОТ СБОЕВ: вернуть ставки из незавершённых дуэлей
   await recoverStuckDuels()
+
+  // МИГРАЦИЯ: привести username к lowercase (SQLite не поддерживает mode: insensitive)
+  await normalizeUsernames()
 
   // Long polling loop — с автоматическим восстановлением
   let offsetStr = String(readPersistedOffset())
