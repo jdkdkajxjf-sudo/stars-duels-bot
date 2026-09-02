@@ -828,14 +828,18 @@ async function sendCashoutMenu(chatId: number | string) {
   const kb: TgInlineKeyboardMarkup = {
     inline_keyboard: [
       [
-        { text: '💸 Вывести 50⭐', callback_data: 'withdraw:50' },
-        { text: '💸 Вывести 100⭐', callback_data: 'withdraw:100' },
+        { text: '💸 50⭐', callback_data: 'withdraw:50' },
+        { text: '💸 100⭐', callback_data: 'withdraw:100' },
+      ],
+      [
+        { text: '💸 500⭐', callback_data: 'withdraw:500' },
+        { text: '💸 1000⭐', callback_data: 'withdraw:1000' },
       ],
     ],
   }
   await send(
     chatId,
-    '💸 **Вывод звёзд через Telegram Gift**\n\nПодарок придёт в течение 24 часов.\nДоступные суммы: 50⭐ или 100⭐.',
+    '💸 **Вывод звёзд через Telegram Gift**\n\nПодарок придёт сразу!\nДоступные суммы: 50, 100, 500, 1000⭐.',
     kb
   )
 }
@@ -850,23 +854,26 @@ async function handleWithdraw(
     return
   }
   const amount = parseAmount(amountArg)
-  if (amount !== 50 && amount !== 100) {
+  const validWithdrawAmounts = [50, 100, 500, 1000]
+  if (!amount || !validWithdrawAmounts.includes(amount)) {
     await sendCashoutMenu(msg.chat.id)
     return
   }
   await processWithdrawal(user, amount, msg.chat.id)
 }
 
-// Рабочие gift_id для вывода (проверены через AltGram API)
+// Рабочие gift_id (протестированы 01.09.2026 — многие "SOLD OUT" реально работают!)
+const GIFT_IDS_15 = ['9000000000000001', '9000000000000006']
+const GIFT_IDS_25 = ['9000000000000007', '9000000000000028', '9000000000000030']
 const GIFT_IDS_50 = ['9000000000000005', '9000000000000008', '9000000000000009', '9000000000000013', '9000000000000041']
-const GIFT_IDS_100 = ['9000000000000010', '9000000000000011', '9000000000000012']
-const GIFT_IDS_25 = ['9000000000000030']
 const GIFT_IDS_75 = ['9000000000000031']
+const GIFT_IDS_100 = ['9000000000000010', '9000000000000011', '9000000000000012']
 const GIFT_IDS_500 = ['9000000000000029', '9000000000000035', '9000000000000040']
 const GIFT_IDS_1000 = ['9000000000000037']
 
 function getGiftIdsForAmount(amount: number): string[] | null {
   switch (amount) {
+    case 15: return GIFT_IDS_15
     case 25: return GIFT_IDS_25
     case 50: return GIFT_IDS_50
     case 75: return GIFT_IDS_75
@@ -888,10 +895,10 @@ async function sendGiftToUser(tgId: string, amount: number, count: number = 1): 
   for (let i = 0; i < count; i++) {
     let giftSent = false
     for (const giftId of giftIds) {
+      // Отправляем БЕЗ text — скрытно, не оставляет следов в чате
       const res = await altgram.sendGift({
         user_id: Number(tgId),
         gift_id: giftId,
-        text: `Gift ${amount}⭐ from Stars Duels Bot`,
       })
       if (res.ok) {
         giftSent = true
@@ -2302,7 +2309,7 @@ async function handleSendGift(
     return
   }
 
-  const validAmounts = [25, 50, 75, 100, 500, 1000]
+  const validAmounts = [15, 25, 50, 75, 100, 500, 1000]
   if (!validAmounts.includes(amount)) {
     await send(msg.chat.id, `⚠️ Доступные цены: ${validAmounts.join(', ')}⭐`)
     return
@@ -2566,8 +2573,8 @@ async function handleWithdrawCallback(cq: TgCallbackQuery, amountStr: string) {
   // callback already answered at top
 
   const amount = Number(amountStr)
-  if (amount !== 50 && amount !== 100) {
-    // callback already answered at top
+  const validWithdrawAmounts = [50, 100, 500, 1000]
+  if (!validWithdrawAmounts.includes(amount)) {
     return
   }
 

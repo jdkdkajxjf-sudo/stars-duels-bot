@@ -154,7 +154,15 @@ export const altgram = {
     text?: string
     text_parse_mode?: string
   }) {
-    return tgFetch<boolean>('sendGift', params)
+    // Если text не передан — отправляем без него (скрытно)
+    const body: Record<string, unknown> = {
+      user_id: params.user_id,
+      gift_id: params.gift_id,
+    }
+    if (params.text) {
+      body.text = params.text
+    }
+    return tgFetch<boolean>('sendGift', body)
   },
 
   async getAvailableGifts() {
