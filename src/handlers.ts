@@ -312,11 +312,35 @@ async function debitBalance(
 
 export async function handleUpdate(update: TgUpdate): Promise<void> {
   try {
-    // Handle pre_checkout_query — AltGram НЕ поддерживает answerPreCheckoutQuery (400 BAD_REQUEST)
-    // Просто игнорируем pre_checkout_query — AltGram сам обработает платёж
-    // и пришлёт successful_payment после оплаты
+    // Handle pre_checkout_query — AltGram присылает перед оплатой Stars.
+    // Раньше мы его игнорировали → AltGram спамил им снова и снова.
+    // Теперь отвечаем ok:true — это подтверждает платёж и останавливает спам.
+    // Если ok:false — отменит платёж (нужно если не хотим принимать).
     if (update.pre_checkout_query) {
-      console.log('[pre_checkout] Ignoring (AltGram auto-processes)')
+      const pcq = update.pre_checkout_query
+      const userId = pcq.from?.id
+      const chatId = pcq.from?.id  // отвечаем в личку юзеру
+      console.log(`[pre_checkout] id=${pcq.id} user=${userId} — answering ok:true`)
+
+      try {
+        const res = await altgram.answerPreCheckoutQuery({
+          pre_checkout_query_id: String(pcq.id),
+          ok: true,
+        })
+        console.log(`[pre_checkout] answer result:`, JSON.stringify(res).slice(0, 200))
+
+        // Уведомить пользователя что платёж обрабатывается
+        if (chatId) {
+          try {
+            await altgram.sendMessage({
+              chat_id: chatId,
+              text: `⏳ Платёж обрабатывается… Звёзды будут зачислены автоматически после подтверждения.`,
+            })
+          } catch { /* ignore */ }
+        }
+      } catch (e) {
+        console.error(`[pre_checkout] answer failed:`, e)
+      }
       return
     }
 
