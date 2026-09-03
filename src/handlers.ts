@@ -2348,10 +2348,9 @@ async function handleAdminStatsCallback(cq: TgCallbackQuery) {
 }
 
 /* ------------------------------------------------------------------ */
-/* /sendgift — админ: отправить gift юзеру                            */
+/* /sendgift — админ: отправить gift юзеру (простой способ, без фильтров) */
 /* /sendgift @user <amount> <count>                                    */
-/* /sendgift @user 1000 5 — отправить 5 gifts по 1000⭐               */
-/* /sendgift <tgId> 1000 5 — отправить по tgId                       */
+/* /sendgift 1780243895 1000 5  (по tgId)                             */
 /* ------------------------------------------------------------------ */
 
 async function handleSendGift(
@@ -2368,61 +2367,36 @@ async function handleSendGift(
   const amountArg = args[1]
   const countArg = args[2] || '1'
 
-  // Убираем @ если есть — принимаем оба формата: @user и user
+  // Убираем @ если есть
   const rawTarget = targetArg.replace(/^@/, '').trim()
-  if (!rawTarget) {
-    await send(msg.chat.id, '⚠️ Использование:\n`/sendgift @user 1000 5`\n\nОтправить gifts юзеру.\nДоступные цены: 15, 25, 50, 75, 100, 500, 1000⭐\n\nМожно указать @username или tgId.')
-    return
-  }
-
   const amount = parseAmount(amountArg)
   const count = Math.min(Math.max(Number(countArg) || 1, 1), 50)
 
-  if (!amount) {
-    await send(msg.chat.id, '⚠️ Укажите цену gift: `/sendgift @user 1000 5`')
+  if (!rawTarget || !amount) {
+    await send(msg.chat.id, '⚠️ Использование:\n`/sendgift @user 1000 5`\n\nЦены: 15, 25, 50, 75, 100, 500, 1000⭐')
     return
   }
 
-  const validAmounts = [15, 25, 50, 75, 100, 500, 1000]
-  if (!validAmounts.includes(amount)) {
-    await send(msg.chat.id, `⚠️ Доступные цены: ${validAmounts.join(', ')}⭐`)
-    return
-  }
+  // Простой поиск юзера: пробуем tgId (число) или username (lowercase)
+  let target: { tgId: string; username: string | null } | null = null
 
-  // Поиск юзера: пробуем по tgId (если число) или по username (lowercase)
-  let target: { id: string; tgId: string; username: string | null; firstName: string | null } | null = null
-
-  // Сначала пробуем как tgId (число)
   if (/^\d+$/.test(rawTarget)) {
+    // Число → ищем по tgId
     target = await db.user.findUnique({
       where: { tgId: rawTarget },
-      select: { id: true, tgId: true, username: true, firstName: true }
+      select: { tgId: true, username: true }
     })
   }
-
-  // Потом по username (всегда lowercase — миграция normalizeUsernames() приводит к lowercase)
   if (!target) {
-    const searchUsername = rawTarget.toLowerCase()
+    // Не число или не найден по tgId → ищем по username (lowercase)
     target = await db.user.findFirst({
-      where: { username: searchUsername },
-      select: { id: true, tgId: true, username: true, firstName: true }
+      where: { username: rawTarget.toLowerCase() },
+      select: { tgId: true, username: true }
     })
   }
 
-  // Если не найден — покажем список всех юзеров для диагностики
   if (!target) {
-    const allUsers = await db.user.findMany({
-      select: { username: true, tgId: true, firstName: true },
-      where: { username: { not: null } },
-    })
-    const list = allUsers
-      .map(u => `• @${u.username ?? '?'} (${u.tgId})`)
-      .slice(0, 20)
-      .join('\n')
-    await send(
-      msg.chat.id,
-      `⚠️ Юзер \`${rawTarget}\` не найден.\n\nЮзеры в БД:\n${list}\n\nЮзер должен запустить /start.`
-    )
+    await send(msg.chat.id, `❌ Юзер \`${rawTarget}\` не найден в БД.`)
     return
   }
 
@@ -2434,22 +2408,17 @@ async function handleSendGift(
   await send(
     msg.chat.id,
     [
-      `🎁 **Результат отправки gifts:**`,
-      '',
+      `🎁 **Результат:**`,
       `👤 Юзер: ${displayName}`,
-      `💰 Цена: ${amount}⭐ за gift`,
-      `📦 Кол-во: ${count}`,
-      '',
+      `💰 ${amount}⭐ × ${count}`,
       `✅ Отправлено: ${sent}`,
       `❌ Не удалось: ${failed}`,
-      `💎 Сумма: ${sent * amount}⭐`,
     ].join('\n')
   )
 
-  // Уведомить получателя
   if (sent > 0) {
     try {
-      await send(target.tgId, `🎁 Вам отправлено ${sent} gifts по ${amount}⭐ от админа!\nПроверьте Telegram — подарки должны прийти.`)
+      await send(target.tgId, `🎁 Вам отправлено ${sent} gifts по ${amount}⭐ от админа!`)
     } catch { /* ignore */ }
   }
 }
