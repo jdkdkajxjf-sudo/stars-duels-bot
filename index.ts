@@ -199,8 +199,24 @@ process.on('SIGTERM', () => void shutdown('SIGTERM'))
 process.on('SIGPIPE', () => {})
 
 // Запуск с авто-рестартом
-main().catch((e) => {
+main().catch(async (e) => {
   console.error('[duels-bot] fatal error:', e)
-  // НЕ exit — оставляем процесс живым чтобы health-check работал
-  // Cron перезапустит через 5 минут
+  // Пробуем перезапуститься через 10 сек
+  console.log('[duels-bot] restarting in 10 seconds...')
+  await new Promise((r) => setTimeout(r, 10_000))
+  // Перезапускаем main
+  main().catch((e2) => {
+    console.error('[duels-bot] second fatal, giving up:', e2)
+    process.exit(1)
+  })
+})
+
+// Ловим unhandled rejections — чтобы бот не падал
+process.on('unhandledRejection', (reason) => {
+  console.error('[duels-bot] unhandledRejection:', reason)
+})
+
+// Ловим uncaught exceptions — чтобы бот не падал
+process.on('uncaughtException', (err) => {
+  console.error('[duels-bot] uncaughtException:', err)
 })
