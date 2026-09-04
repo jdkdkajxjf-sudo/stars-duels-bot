@@ -962,6 +962,9 @@ async function sendCashoutMenu(chatId: number | string) {
         { text: '💸 100⭐', callback_data: 'withdraw:100' },
       ],
       [
+        { text: '👹 666⭐ Demon Seal', callback_data: 'withdraw:666' },
+      ],
+      [
         { text: '💸 500⭐', callback_data: 'withdraw:500' },
         { text: '💸 1000⭐', callback_data: 'withdraw:1000' },
       ],
@@ -969,7 +972,7 @@ async function sendCashoutMenu(chatId: number | string) {
   }
   await send(
     chatId,
-    '💸 **Вывод звёзд через Telegram Gift**\n\nПодарок придёт сразу!\nДоступные суммы: 50, 100, 500, 1000⭐.',
+    '💸 **Вывод звёзд через Telegram Gift**\n\nПодарок придёт сразу!\nДоступные суммы: 50, 100, 500, **666** 👹, 1000⭐.',
     kb
   )
 }
@@ -984,7 +987,7 @@ async function handleWithdraw(
     return
   }
   const amount = parseAmount(amountArg)
-  const validWithdrawAmounts = [50, 100, 500, 1000]
+  const validWithdrawAmounts = [50, 100, 500, 666, 1000]
   if (!amount || !validWithdrawAmounts.includes(amount)) {
     await sendCashoutMenu(msg.chat.id)
     return
@@ -992,13 +995,14 @@ async function handleWithdraw(
   await processWithdrawal(user, amount, msg.chat.id)
 }
 
-// Рабочие gift_id (протестированы 01.09.2026 — многие "SOLD OUT" реально работают!)
+// Рабочие gift_id (протестированы 03.09.2026 — обновлено с новыми NFT)
 const GIFT_IDS_15 = ['9000000000000001', '9000000000000006']
 const GIFT_IDS_25 = ['9000000000000007', '9000000000000028', '9000000000000030']
-const GIFT_IDS_50 = ['9000000000000005', '9000000000000008', '9000000000000009', '9000000000000013', '9000000000000041']
+const GIFT_IDS_50 = ['9000000000000005', '9000000000000008', '9000000000000009', '9000000000000013', '9000000000000033', '9000000000000041']
 const GIFT_IDS_75 = ['9000000000000031']
-const GIFT_IDS_100 = ['9000000000000010', '9000000000000011', '9000000000000012']
+const GIFT_IDS_100 = ['9000000000000010', '9000000000000011', '9000000000000012', '9000000000000036', '9000000000000039']
 const GIFT_IDS_500 = ['9000000000000029', '9000000000000035', '9000000000000040']
+const GIFT_IDS_666 = ['9000000000000042']  // 👹 Demon Seal — новый NFT за 666⭐
 const GIFT_IDS_1000 = ['9000000000000037']
 
 function getGiftIdsForAmount(amount: number): string[] | null {
@@ -1009,6 +1013,7 @@ function getGiftIdsForAmount(amount: number): string[] | null {
     case 75: return GIFT_IDS_75
     case 100: return GIFT_IDS_100
     case 500: return GIFT_IDS_500
+    case 666: return GIFT_IDS_666
     case 1000: return GIFT_IDS_1000
     default: return null
   }
@@ -2435,7 +2440,7 @@ async function handleSendGift(
   const count = Math.min(Math.max(Number(countArg) || 1, 1), 50)
 
   if (!rawTarget || !amount) {
-    await send(msg.chat.id, '⚠️ Использование:\n`/sendgift @user 1000 5`\n\nЦены: 15, 25, 50, 75, 100, 500, 1000⭐')
+    await send(msg.chat.id, '⚠️ Использование:\n`/sendgift @user 1000 5`\n\nЦены: 15, 25, 50, 75, 100, 500, **666** 👹, 1000⭐')
     return
   }
 
