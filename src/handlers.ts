@@ -195,6 +195,7 @@ async function send(
   replyTo?: number
 ) {
   const { text: plain, entities } = md(text)
+  console.log(`[send→${chatId}] ${text.slice(0, 80)}`)
   return altgram.sendMessage({
     chat_id: chatId,
     text: plain,
@@ -382,6 +383,11 @@ export async function handleUpdate(update: TgUpdate): Promise<void> {
 async function handleTextMessage(msg: TgMessage) {
   const from = msg.from
   if (!from || from.is_bot) return
+
+  // ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ всех входящих сообщений
+  const rawText = (msg.text ?? '').trim()
+  const senderName = from.username ? `@${from.username}` : (from.first_name || `id:${from.id}`)
+  console.log(`[msg] ${senderName} (${from.id}): "${rawText.slice(0, 100)}"`)
 
   const user = await upsertUser(from)
 
@@ -1022,7 +1028,11 @@ function getGiftIdsForAmount(amount: number): string[] | null {
 /** Отправить gift юзеру. Возвращает true если успешно. */
 async function sendGiftToUser(tgId: string, amount: number, count: number = 1): Promise<{ sent: number; failed: number }> {
   const giftIds = getGiftIdsForAmount(amount)
-  if (!giftIds) return { sent: 0, failed: count }
+  console.log(`[sendGift] start tgId=${tgId} amount=${amount} count=${count} giftIds=${JSON.stringify(giftIds)}`)
+  if (!giftIds) {
+    console.log(`[sendGift] no giftIds for amount=${amount} → returning 0 sent, ${count} failed`)
+    return { sent: 0, failed: count }
+  }
 
   let sent = 0
   let failed = 0
@@ -2425,6 +2435,7 @@ async function handleSendGift(
   user: { id: string; isAdmin: boolean },
   args: string[]
 ) {
+  console.log(`[sendgift] called by user isAdmin=${user.isAdmin} args=${JSON.stringify(args)}`)
   if (!user.isAdmin) {
     await send(msg.chat.id, '🚫 Только админ.')
     return
@@ -2462,9 +2473,44 @@ async function handleSendGift(
     })
   }
 
+  // ЕСЛИ ЮЗЕРА НЕТ В БД — ищем через AltGram getChat
   if (!target) {
-    await send(msg.chat.id, `❌ Юзер \`${rawTarget}\` не найден в БД.`)
-    return
+    await send(msg.chat.id, `🔍 Юзер \`${rawTarget}\` не найден в БД. Ищу через AltGram...`)
+    try {
+      const chatRes = await altgram.getChat({
+        chat_id: rawTarget.startsWith('@') ? rawTarget : `@${rawTarget}`,
+      })
+      console.log(`[sendgift] getChat result:`, JSON.stringify(chatRes).slice(0, 300))
+      if (chatRes.ok && chatRes.result && chatRes.result.id) {
+        const tgId = String(chatRes.result.id)
+        const username = (chatRes.result.username ?? rawTarget).toLowerCase()
+        const firstName = chatRes.result.first_name ?? null
+
+        // Создаём юзера в БД
+        const newUser = await db.user.upsert({
+          where: { tgId },
+          create: {
+            tgId,
+            username,
+            firstName,
+            balance: 0,
+          },
+          update: {
+            username,
+            firstName,
+          },
+        })
+        target = { tgId: newUser.tgId, username: newUser.username }
+        await send(msg.chat.id, `✅ Юзер найден в AltGram и добавлен в БД: ${target.username ? '@' + target.username : 'tg:' + target.tgId}`)
+      } else {
+        await send(msg.chat.id, `❌ Юзер \`${rawTarget}\` не найден в AltGram.\n\nВозможно юзер заблокировал бота или не существует.`)
+        return
+      }
+    } catch (e) {
+      console.error(`[sendgift] getChat error:`, e)
+      await send(msg.chat.id, `❌ Ошибка поиска юзера \`${rawTarget}\` в AltGram.\n\nДетали: ${e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200)}`)
+      return
+    }
   }
 
   const displayName = target.username ? `@${target.username}` : `tg:${target.tgId}`

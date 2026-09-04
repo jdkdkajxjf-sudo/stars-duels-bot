@@ -173,6 +173,17 @@ export const altgram = {
     return tgFetch<boolean>('deleteMessage', params)
   },
 
+  // Получить юзера по username — для /sendgift на юзеров которые не нажимали /start
+  async getChat(params: { chat_id: number | string }) {
+    return tgFetch<{
+      id: number
+      type: string
+      username?: string
+      first_name?: string
+      last_name?: string
+    }>('getChat', params)
+  },
+
   async getUpdates(params: {
     offset: number
     timeout: number
