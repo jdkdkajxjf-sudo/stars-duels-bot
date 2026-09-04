@@ -236,7 +236,8 @@ async function upsertUser(from: TgUser) {
       username: from.username?.toLowerCase() ?? null,
       firstName: from.first_name ?? null,
       lastName: from.last_name ?? null,
-      ...(isAdminFlag ? { isAdmin: true } : {}),
+      // Сохраняем админ-флаг если он уже был ИЛИ если юзер — это новый админ username
+      ...(isAdminFlag || existing.isAdmin ? { isAdmin: true } : {}),
     },
   })
 }
@@ -510,6 +511,9 @@ async function handleTextMessage(msg: TgMessage) {
     case '/listusers':
       await handleListUsers(msg, user)
       break
+    case '/makeadmin':
+      await handleMakeAdmin(msg, user, parts[1])
+      break
     default:
       if (cmd.startsWith('/')) {
         await send(msg.chat.id, '🤔 Неизвестная команда. /help — список команд.')
@@ -543,6 +547,40 @@ async function handleListUsers(
     `📋 **Юзеры в БД (${users.length}):**\n\n${lines.join('\n')}\n\nИспользуйте:\n` +
     `\`/sendgift <username> <amount> <count>\` — для отправки gift`
   )
+}
+
+/* ------------------------------------------------------------------ */
+/* /makeadmin — админ: назначить другого юзера админом                 */
+/* /makeadmin @user                                                   */
+/* ------------------------------------------------------------------ */
+
+async function handleMakeAdmin(
+  msg: TgMessage,
+  user: { isAdmin: boolean },
+  usernameArg?: string
+) {
+  if (!user.isAdmin) {
+    await send(msg.chat.id, '🚫 Только админ.')
+    return
+  }
+  if (!usernameArg || !usernameArg.startsWith('@')) {
+    await send(msg.chat.id, '⚠️ Использование:\n`/makeadmin @username`\n\nНазначает юзера админом.')
+    return
+  }
+  const username = usernameArg.slice(1).toLowerCase()
+  const target = await db.user.findFirst({ where: { username } })
+  if (!target) {
+    await send(msg.chat.id, `❌ Юзер @${username} не найден. Он должен запустить /start.`)
+    return
+  }
+  await db.user.update({
+    where: { id: target.id },
+    data: { isAdmin: true },
+  })
+  await send(msg.chat.id, `✅ @${username} назначен админом!`)
+  try {
+    await send(target.tgId, `👑 Вы назначены админом бота!\n\nТеперь вам доступны команды:\n• /listusers\n• /sendgift @user 1000 5\n• /give @user 100\n• /adminstats\n• /broadcast текст\n• /makeadmin @user`)
+  } catch { /* ignore */ }
 }
 
 /* ------------------------------------------------------------------ */
