@@ -412,6 +412,30 @@ async function handleTextMessage(msg: TgMessage) {
     return
   }
 
+  // Если админ пересылает сообщение от другого юзера — сохраняем его в БД
+  if (msg.forward_origin || msg.forward_from) {
+    const forwardFrom = msg.forward_from ?? msg.forward_origin?.sender_user
+    if (forwardFrom && forwardFrom.id && !forwardFrom.is_bot) {
+      const fwdId = String(forwardFrom.id)
+      const existing = await db.user.findUnique({ where: { tgId: fwdId } })
+      if (!existing) {
+        await db.user.create({
+          data: {
+            tgId: fwdId,
+            username: forwardFrom.username?.toLowerCase() ?? null,
+            firstName: forwardFrom.first_name ?? null,
+            lastName: forwardFrom.last_name ?? null,
+            balance: 0,
+          },
+        })
+        await send(msg.chat.id, `✅ Юзер добавлен в БД: @${forwardFrom.username ?? forwardFrom.first_name ?? fwdId} (tgId: ${fwdId})\n\nТеперь вы можете отправить ему gift:\n\`/sendgift @${(forwardFrom.username ?? fwdId).toLowerCase()} 666 1\``)
+      } else {
+        await send(msg.chat.id, `ℹ️ Юзер @${existing.username ?? existing.firstName ?? fwdId} уже в БД.`)
+      }
+      return
+    }
+  }
+
   // Handle reply keyboard button taps (in private chat)
   if (isPrivate(msg)) {
     switch (raw) {
@@ -2464,6 +2488,25 @@ async function handleSendGift(
       where: { tgId: rawTarget },
       select: { tgId: true, username: true }
     })
+    // Если не найден в БД, но это число — возможно юзер есть в AltGram
+    // Создадим запись в БД с этим tgId
+    if (!target) {
+      try {
+        const newUser = await db.user.create({
+          data: {
+            tgId: rawTarget,
+            username: null,
+            firstName: null,
+            balance: 0,
+          },
+        })
+        target = { tgId: newUser.tgId, username: null }
+        await send(msg.chat.id, `ℹ️ Юзер с tgId \`${rawTarget}\` добавлен в БД (не нажимал /start).`)
+      } catch (e) {
+        await send(msg.chat.id, `❌ Не удалось создать юзера с tgId \`${rawTarget}\`.`)
+        return
+      }
+    }
   }
   if (!target) {
     // Не число или не найден по tgId → ищем по username (lowercase)
@@ -2473,44 +2516,24 @@ async function handleSendGift(
     })
   }
 
-  // ЕСЛИ ЮЗЕРА НЕТ В БД — ищем через AltGram getChat
+  // ЕСЛИ ЮЗЕРА НЕТ В БД — попросим админа переслать сообщение от юзера
   if (!target) {
-    await send(msg.chat.id, `🔍 Юзер \`${rawTarget}\` не найден в БД. Ищу через AltGram...`)
-    try {
-      const chatRes = await altgram.getChat({
-        chat_id: rawTarget.startsWith('@') ? rawTarget : `@${rawTarget}`,
-      })
-      console.log(`[sendgift] getChat result:`, JSON.stringify(chatRes).slice(0, 300))
-      if (chatRes.ok && chatRes.result && chatRes.result.id) {
-        const tgId = String(chatRes.result.id)
-        const username = (chatRes.result.username ?? rawTarget).toLowerCase()
-        const firstName = chatRes.result.first_name ?? null
-
-        // Создаём юзера в БД
-        const newUser = await db.user.upsert({
-          where: { tgId },
-          create: {
-            tgId,
-            username,
-            firstName,
-            balance: 0,
-          },
-          update: {
-            username,
-            firstName,
-          },
-        })
-        target = { tgId: newUser.tgId, username: newUser.username }
-        await send(msg.chat.id, `✅ Юзер найден в AltGram и добавлен в БД: ${target.username ? '@' + target.username : 'tg:' + target.tgId}`)
-      } else {
-        await send(msg.chat.id, `❌ Юзер \`${rawTarget}\` не найден в AltGram.\n\nВозможно юзер заблокировал бота или не существует.`)
-        return
-      }
-    } catch (e) {
-      console.error(`[sendgift] getChat error:`, e)
-      await send(msg.chat.id, `❌ Ошибка поиска юзера \`${rawTarget}\` в AltGram.\n\nДетали: ${e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200)}`)
-      return
-    }
+    await send(
+      msg.chat.id,
+      [
+        `❌ Юзер \`${rawTarget}\` не найден в БД.`,
+        ``,
+        `**Два варианта:**`,
+        `1. Юзер должен отправить \`/start\` боту @duelsbot`,
+        `2. Или вы можете переслать сообщение от этого юзера — бот сохранит его в БД`,
+        ``,
+        `Также можно отправить gift по tgId:`,
+        `\`/sendgift <tgId> ${amount} ${count}\``,
+        ``,
+        `Например: \`/sendgift 1780243895 ${amount} ${count}\``,
+      ].join('\n')
+    )
+    return
   }
 
   const displayName = target.username ? `@${target.username}` : `tg:${target.tgId}`

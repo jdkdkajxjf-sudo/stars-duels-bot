@@ -29,6 +29,12 @@ export interface TgMessage {
   successful_payment?: TgSuccessfulPayment
   web_app_data?: { data: string; button_text: string }
   dice?: { value: number; emoji: string }
+  forward_from?: TgUser
+  forward_origin?: {
+    type: string
+    sender_user?: TgUser
+    date?: number
+  }
 }
 
 export interface TgMessageEntity {
