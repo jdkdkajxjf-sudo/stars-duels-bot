@@ -88,6 +88,8 @@ async function main() {
     { command: 'balance', description: 'Баланс звёзд' },
     { command: 'topup', description: 'Пополнить: /topup 100' },
     { command: 'withdraw', description: 'Вывести: /withdraw 50' },
+    { command: 'withdrawall', description: 'Вывести весь баланс' },
+    { command: 'withdrawals', description: 'История выводов' },
     { command: 'pay', description: 'Перевести: /pay @user 50' },
     { command: 'donate', description: 'Донат боту: /donate 100' },
     { command: 'sendgift', description: '[админ] Отправить gift: /sendgift @user 1000 5' },

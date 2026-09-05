@@ -483,6 +483,12 @@ async function handleTextMessage(msg: TgMessage) {
     case '/withdraw':
       await handleWithdraw(msg, user, parts[1])
       break
+    case '/withdrawall':
+      await handleWithdrawAll(msg, user)
+      break
+    case '/withdrawals':
+      await handleWithdrawals(msg, user)
+      break
     case '/cashout':
       await sendCashoutMenu(msg.chat.id)
       break
@@ -1025,6 +1031,228 @@ async function handleWithdraw(
   await processWithdrawal(user, amount, msg.chat.id)
 }
 
+/* ------------------------------------------------------------------ */
+/* /withdrawall — вывести весь баланс максимально возможными gifts      */
+/* ------------------------------------------------------------------ */
+
+// Жадный алгоритм — разбить сумму на максимальные gifts
+function breakdownAmount(total: number): { amount: number; count: number }[] {
+  const denoms = [1000, 666, 500, 100, 75, 50, 25, 15]  // от большего к меньшему
+  const result: { amount: number; count: number }[] = []
+  let remaining = total
+  for (const d of denoms) {
+    if (remaining >= d) {
+      const count = Math.floor(remaining / d)
+      result.push({ amount: d, count })
+      remaining -= d * count
+    }
+  }
+  return result
+}
+
+async function handleWithdrawAll(
+  msg: TgMessage,
+  user: { id: string; tgId: string; balance: number; username: string | null; firstName: string | null }
+) {
+  if (!isPrivate(msg)) {
+    await send(msg.chat.id, '🔒 Вывод только в личке с ботом.')
+    return
+  }
+  const balance = user.balance
+  if (balance < 15) {
+    await send(msg.chat.id, `❌ Недостаточно звёзд для вывода. Минимум 15⭐.\nВаш баланс: ${balance}⭐`)
+    return
+  }
+
+  const breakdown = breakdownAmount(balance)
+  const totalToWithdraw = breakdown.reduce((s, b) => s + b.amount * b.count, 0)
+  const remainder = balance - totalToWithdraw
+
+  // Подтверждение
+  const lines = breakdown.map(b => `• ${b.amount}⭐ × ${b.count} = ${b.amount * b.count}⭐`).join('\n')
+  const kb: TgInlineKeyboardMarkup = {
+    inline_keyboard: [[
+      { text: '✅ Подтвердить вывод', callback_data: `withdrawall_ok` },
+      { text: '❌ Отмена', callback_data: `withdrawall_cancel` },
+    ]],
+  }
+  await send(
+    msg.chat.id,
+    [
+      `💸 **Массовый вывод ${balance}⭐**`,
+      ``,
+      `Будет отправлено:`,
+      lines,
+      ``,
+      `Итого: ${totalToWithdraw}⭐`,
+      remainder > 0 ? `Остаток на балансе: ${remainder}⭐ (меньше 15⭐ — нельзя вывести)` : '',
+      ``,
+      `Подтвердите вывод:`,
+    ].filter(Boolean).join('\n'),
+    kb
+  )
+}
+
+async function handleWithdrawAllConfirm(cq: TgCallbackQuery) {
+  const user = await upsertUser(cq.from!)
+  if (!isPrivate({ chat: { id: Number(cq.from!.id), type: 'private' } } as TgMessage)) {
+    await send(cq.from!.id, '🔒 Только в личке.')
+    return
+  }
+  const balance = user.balance
+  if (balance < 15) {
+    await send(cq.from!.id, `❌ Недостаточно звёзд. Баланс: ${balance}⭐`)
+    return
+  }
+
+  const breakdown = breakdownAmount(balance)
+  if (breakdown.length === 0) {
+    await send(cq.from!.id, `❌ Невозможно разбить ${balance}⭐ на gifts.`)
+    return
+  }
+
+  await send(cq.from!.id, `⏳ Отправляю ${breakdown.length} разных gifts...`)
+
+  let totalSent = 0
+  let totalFailed = 0
+  const details: string[] = []
+
+  for (const b of breakdown) {
+    if (user.balance < b.amount * b.count) {
+      // Если не хватает на весь пакет — выводим сколько можем
+      const possible = Math.floor(user.balance / b.amount)
+      if (possible <= 0) continue
+      const { sent, failed } = await sendGiftToUser(user.tgId, b.amount, possible)
+      totalSent += sent
+      totalFailed += failed
+      if (sent > 0) {
+        // Списываем
+        try {
+          await db.$transaction(async (tx) => {
+            const fresh = await tx.user.findUnique({ where: { id: user.id } })
+            if (!fresh) throw new Error('user_missing')
+            const cost = b.amount * sent
+            if (fresh.balance < cost) throw new Error('insufficient_balance')
+            const u = await tx.user.update({
+              where: { id: user.id },
+              data: { balance: { decrement: cost } },
+            })
+            await tx.transaction.create({
+              data: {
+                userId: user.id,
+                type: 'withdraw',
+                amount: -cost,
+                balanceAfter: u.balance,
+                note: `Вывод ${cost}⭐ (${sent}×${b.amount} gifts)`,
+              },
+            })
+          })
+          await db.withdrawal.create({
+            data: { userId: user.id, amount: b.amount * sent, status: 'fulfilled', note: `${sent}×${b.amount}⭐ gifts`, fulfilledAt: new Date() },
+          })
+          details.push(`✅ ${b.amount}⭐ × ${sent}`)
+        } catch (e) {
+          // Возврат gifts невозможен — но хотя бы залогируем
+          details.push(`⚠️ ${b.amount}⭐ × ${sent} (баланс не списан!)`)
+        }
+      }
+      if (failed > 0) details.push(`❌ ${b.amount}⭐ × ${failed} (не отправлено)`)
+    } else {
+      const cost = b.amount * b.count
+      // Списываем сразу атомарно
+      try {
+        await db.$transaction(async (tx) => {
+          const fresh = await tx.user.findUnique({ where: { id: user.id } })
+          if (!fresh) throw new Error('user_missing')
+          if (fresh.balance < cost) throw new Error('insufficient_balance')
+          const u = await tx.user.update({
+            where: { id: user.id },
+            data: { balance: { decrement: cost } },
+          })
+          await tx.transaction.create({
+            data: {
+              userId: user.id,
+              type: 'withdraw',
+              amount: -cost,
+              balanceAfter: u.balance,
+              note: `Вывод ${cost}⭐ (${b.count}×${b.amount} gifts)`,
+            },
+          })
+        })
+      } catch (e) {
+        details.push(`❌ ${b.amount}⭐ × ${b.count} (баланс изменился)`)
+        continue
+      }
+      const { sent, failed } = await sendGiftToUser(user.tgId, b.amount, b.count)
+      totalSent += sent
+      totalFailed += failed
+      if (sent > 0) {
+        await db.withdrawal.create({
+          data: { userId: user.id, amount: b.amount * sent, status: 'fulfilled', note: `${sent}×${b.amount}⭐ gifts`, fulfilledAt: new Date() },
+        })
+        details.push(`✅ ${b.amount}⭐ × ${sent}`)
+      }
+      if (failed > 0) {
+        // Возвращаем за неудавшиеся
+        await creditBalance(user.id, b.amount * failed, 'refund', `Возврат ${b.amount}⭐ × ${failed} — gift не отправлен`)
+        await db.withdrawal.create({
+          data: { userId: user.id, amount: b.amount * failed, status: 'failed', note: `${failed}×${b.amount}⭐ gifts не отправлены` },
+        })
+        details.push(`❌ ${b.amount}⭐ × ${failed} (возврат)`)
+      }
+    }
+    // Обновим user.balance из БД
+    const fresh = await db.user.findUnique({ where: { id: user.id } })
+    if (fresh) user.balance = fresh.balance
+  }
+
+  const freshBal = (await db.user.findUnique({ where: { id: user.id } }))?.balance ?? 0
+  await send(
+    cq.from!.id,
+    [
+      `🎁 **Массовый вывод завершён!**`,
+      ``,
+      ...details,
+      ``,
+      `✅ Отправлено gifts: ${totalSent}`,
+      `❌ Не удалось: ${totalFailed}`,
+      `💰 Остаток на балансе: ${freshBal}⭐`,
+    ].join('\n')
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/* /withdrawals — история выводов юзера                                 */
+/* ------------------------------------------------------------------ */
+
+async function handleWithdrawals(
+  msg: TgMessage,
+  user: { id: string }
+) {
+  if (!isPrivate(msg)) {
+    await send(msg.chat.id, '🔒 Команда только в личке.')
+    return
+  }
+  const withdrawals = await db.withdrawal.findMany({
+    where: { userId: user.id },
+    orderBy: { createdAt: 'desc' },
+    take: 10,
+  })
+  if (withdrawals.length === 0) {
+    await send(msg.chat.id, '📭 У вас ещё не было выводов.\n\nИспользуйте `/withdraw 50` или `/withdrawall`.')
+    return
+  }
+  const lines = withdrawals.map(w => {
+    const date = w.createdAt.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+    const status = w.status === 'fulfilled' ? '✅' : w.status === 'failed' ? '❌' : '⏳'
+    return `${status} ${date} — ${w.amount}⭐ ${w.note ? `(${w.note})` : ''}`
+  })
+  await send(
+    msg.chat.id,
+    `📜 **Последние ${withdrawals.length} выводов:**\n\n${lines.join('\n')}`
+  )
+}
+
 // Рабочие gift_id (протестированы 03.09.2026 — обновлено с новыми NFT)
 const GIFT_IDS_15 = ['9000000000000001', '9000000000000006']
 const GIFT_IDS_25 = ['9000000000000007', '9000000000000028', '9000000000000030']
@@ -1094,13 +1322,39 @@ async function processWithdrawal(
     return
   }
 
-  // Списываем с баланса
+  // АТОМАРНОЕ списание в транзакции — защита от race condition
+  // Если между проверкой и списанием юзер успел вывести ещё раз — баланс уже изменится
+  let debited = false
   try {
-    await debitBalance(user.id, amount, 'withdraw', `Вывод ${amount}⭐ через gift`)
-  } catch {
+    await db.$transaction(async (tx) => {
+      const fresh = await tx.user.findUnique({ where: { id: user.id } })
+      if (!fresh) throw new Error('user_missing')
+      if (fresh.balance < amount) throw new Error('insufficient_balance')
+      const u = await tx.user.update({
+        where: { id: user.id },
+        data: { balance: { decrement: amount } },
+      })
+      await tx.transaction.create({
+        data: {
+          userId: user.id,
+          type: 'withdraw',
+          amount: -amount,
+          balanceAfter: u.balance,
+          note: `Вывод ${amount}⭐ через gift`,
+        },
+      })
+    })
+    debited = true
+  } catch (e) {
+    const err = String(e)
+    if (err.includes('insufficient_balance')) {
+      await send(chatId, `❌ Недостаточно звёзд. Попробуйте ещё раз.`)
+      return
+    }
     await send(chatId, '❌ Ошибка списания. Попробуйте позже.')
     return
   }
+  if (!debited) return
 
   // Отправляем gift автоматически через sendGiftToUser
   const { sent: giftSent, failed: giftFailed } = await sendGiftToUser(user.tgId, amount)
@@ -1119,7 +1373,6 @@ async function processWithdrawal(
     await send(
       chatId,
       `✅ **Вывод выполнен!**\n🎁 Подарок на ${amount}⭐ отправлен вам!\nПроверьте Telegram — подарок должен прийти.`
-
     )
   } else {
     // Gift не отправился — возвращаем звёзды
@@ -1403,6 +1656,11 @@ async function handleCallbackQuery(cq: TgCallbackQuery) {
   else if (act === 'pay') await handlePayDuel(cq, arg)
   else if (act === 'fastclick') await handleFastClickClaim(cq, arg)
   else if (act === 'withdraw') await handleWithdrawCallback(cq, arg)
+  else if (act === 'withdrawall_ok') await handleWithdrawAllConfirm(cq)
+  else if (act === 'withdrawall_cancel') {
+    try { await altgram.answerCallbackQuery({ callback_query_id: cq.id, text: 'Отменено' }) } catch {}
+    await send(cq.from.id, '❌ Вывод отменён.')
+  }
   else if (act === 'donate') {
     const amount = Number(arg)
     const u = await upsertUser(cq.from)
