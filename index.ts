@@ -6,6 +6,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { altgram } from './src/altgram'
 import { handleUpdate, recoverStuckDuels, normalizeUsernames } from './src/handlers'
+import { db } from './src/db'
 import type { TgUpdate, TgUser } from './src/types'
 
 const PORT = Number(process.env.PORT) || 3006
@@ -105,6 +106,16 @@ async function main() {
   console.log(`[duels-bot] setMyCommands ok`)
 
   console.log(`Bot started as @${me.username}, polling AltGram…`)
+
+  // ПРОВЕРКА БД: логируем тип подключения
+  try {
+    const userCount = await db.user.count()
+    console.log(`[db] Подключено. Юзеров в БД: ${userCount}`)
+  } catch (e) {
+    console.error(`[db] ОШИБКА подключения к БД:`, e)
+    console.error(`[db] DATABASE_URL = ${process.env.DATABASE_URL?.slice(0, 50)}...`)
+    throw e
+  }
 
   // ЗАЩИТА ОТ СБОЕВ: вернуть ставки из незавершённых дуэлей
   await recoverStuckDuels()
