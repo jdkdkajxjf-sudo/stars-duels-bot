@@ -1,6 +1,7 @@
 # Render.com deployment config
 # Free tier: 512MB RAM, Docker support, no card required
-# Note: free tier sleeps after 15 min — use UptimeRobot to ping /health
+# PostgreSQL database is FREE and PERSISTENT (data never lost!)
+# Note: free tier sleeps after 15 min — but bot pings itself every 30s via cloud-keepalive.sh
 
 services:
   - type: web
@@ -16,10 +17,17 @@ services:
       - key: ALTGRAM_API_URL
         value: http://188.134.95.254:2610
       - key: ADMIN_USERNAME
-        value: crash
+        value: xyz
       - key: COMMISSION_RATE
         value: "0.10"
       - key: DATABASE_URL
-        sync: false
+        fromDatabase:
+          name: duels-db
+          property: connectionString
       - key: PORT
         value: "3006"
+
+databases:
+  - name: duels-db
+    plan: free
+    ipAllowList: []  # allow all IPs

@@ -4,7 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun --hot index.ts"
+    "dev": "bun --hot index.ts",
+    "start": "bun index.ts",
+    "postinstall": "prisma generate",
+    "setup:sqlite": "sed -i 's/provider = \"postgresql\"/provider = \"sqlite\"/' prisma/schema.prisma && prisma generate && prisma db push --accept-data-loss",
+    "setup:postgres": "sed -i 's/provider = \"sqlite\"/provider = \"postgresql\"/' prisma/schema.prisma && prisma generate && prisma db push --accept-data-loss"
   },
   "dependencies": {
     "@prisma/client": "^6.11.1",

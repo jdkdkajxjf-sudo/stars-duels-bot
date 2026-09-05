@@ -22,5 +22,5 @@ EXPOSE 3006
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD curl -f http://localhost:3006/health || exit 1
 
-# Start: run migrations then start bot
-CMD ["sh", "-c", "bunx prisma db push --accept-data-loss && bun index.ts"]
+# Start: detect DB provider (postgresql:// or file:), run migrations, then start bot
+CMD ["sh", "-c", "if [ -z \"$DATABASE_URL\" ]; then echo 'FATAL: DATABASE_URL not set'; exit 1; fi && if echo $DATABASE_URL | grep -q '^file:'; then echo 'SQLite mode' && sed -i 's/provider = \"postgresql\"/provider = \"sqlite\"/' prisma/schema.prisma && bunx prisma generate; else echo 'PostgreSQL mode'; fi && bunx prisma db push --accept-data-loss && bun index.ts"]
