@@ -3,11 +3,9 @@ generator client {
   provider = "prisma-client-js"
 }
 
-// Авто-detection: postgresql:// → PostgreSQL, file: → SQLite
-// На Render DATABASE_URL=postgresql://..., на Cloud Shell/localhost=file:./duels.db
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  url      = "postgresql://postgres.izxodeqeofxkyeluymvz:wp8dZOTICPfYBCBQ@aws-0-eu-central-1.pooler.supabase.com:5432/postgres"
 }
 
 model User {

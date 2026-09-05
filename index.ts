@@ -4,6 +4,12 @@
  */
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { config } from 'dotenv'
+import { resolve } from 'path'
+
+// Загружаем .env из папки duels-bot (важно — ДО импорта Prisma)
+config({ path: resolve(import.meta.dir, '.env') })
+
 import { altgram } from './src/altgram'
 import { handleUpdate, recoverStuckDuels, normalizeUsernames } from './src/handlers'
 import { db } from './src/db'
