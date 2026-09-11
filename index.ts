@@ -145,7 +145,7 @@ async function main() {
       const res = await fetch(apiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: `{"offset":${offsetStr},"timeout":${POLL_TIMEOUT},"allowed_updates":["message","callback_query","edited_message","pre_checkout_query"]}`,
+        body: `{"offset":${offsetStr},"timeout":${POLL_TIMEOUT},"allowed_updates":["message","callback_query","edited_message","pre_checkout_query","successful_payment"]}`,
       })
 
       if (!res.ok) {

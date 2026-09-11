@@ -38,6 +38,7 @@ model User {
   withdrawals   Withdrawal[]
   promoRedemptions PromoRedemption[]
   fastClicksWon  FastClick[]
+  invoices       Invoice[]
   duelsAsPlayer1 Duel[] @relation("DuelPlayer1")
   duelsAsPlayer2 Duel[] @relation("DuelPlayer2")
   duelsWonRel   Duel[]  @relation("DuelWinner")
@@ -143,6 +144,22 @@ model DailyClaim {
   streak        Int      @default(1)
 
   user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// Инвойс на пополнение: mapping message_id → (userId, amount).
+// AltGram после оплаты шлёт callback __invoice_pay:<id> БЕЗ payload,
+// поэтому сопоставляем оплату по message_id инвойса.
+model Invoice {
+  id        String   @id @default(cuid())
+  msgId     Int      @unique
+  userId    String
+  amount    Int
+  status    String   @default("pending") // pending | paid
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
 }
 
 model Withdrawal {

@@ -308,6 +308,42 @@ async function debitBalance(
   })
 }
 
+/**
+ * Начисление депозита юзеру: баланс + реферальный бонус (5% или 10% при 10+ рефералах).
+ * Общая функция для handleSuccessfulPayment и __invoice_pay callback.
+ * Возвращает новый баланс юзера.
+ */
+async function grantDeposit(userId: string, amount: number, note: string): Promise<number> {
+  const u = await creditBalance(userId, amount, 'deposit', note)
+
+  // Реферальный бонус рефереру
+  const withRef = await db.user.findUnique({ where: { id: userId }, include: { referrer: true } })
+  if (withRef?.referrer) {
+    const referralCount = await db.user.count({ where: { referredById: withRef.referrer.id } })
+    const rate = referralCount >= 10 ? 0.10 : 0.05
+    const bonus = Math.floor(amount * rate)
+    if (bonus > 0) {
+      await creditBalance(withRef.referrer.id, bonus, 'referral', `${Math.round(rate * 100)}% от пополнения реферала (${amount}⭐)`)
+    }
+
+    // Milestone: ровно 10 рефералов → +50⭐ разовый бонус
+    if (referralCount === 10) {
+      const already = await db.transaction.findFirst({
+        where: { userId: withRef.referrer.id, type: 'referral_milestone' },
+      })
+      if (!already) {
+        await creditBalance(withRef.referrer.id, 50, 'referral_milestone', 'Бонус за 10 рефералов!')
+        try {
+          await send(withRef.referrer.tgId, `🎉 **Бонус за 10 рефералов!** +50⭐ на баланс!\nТеперь вы получаете 10% от пополнений рефералов!`)
+        } catch { /* ignore */ }
+      }
+    }
+  }
+
+  const fresh = await db.user.findUnique({ where: { id: userId } })
+  return fresh?.balance ?? u.balance
+}
+
 /* ------------------------------------------------------------------ */
 /* Update dispatch                                                     */
 /* ------------------------------------------------------------------ */
@@ -322,7 +358,8 @@ export async function handleUpdate(update: TgUpdate): Promise<void> {
       const pcq = update.pre_checkout_query
       const userId = pcq.from?.id
       const chatId = pcq.from?.id  // отвечаем в личку юзеру
-      console.log(`[pre_checkout] id=${pcq.id} user=${userId} — answering ok:true`)
+      console.log(`[pre_checkout] FULL pcq:`, JSON.stringify(pcq).slice(0, 800))
+      console.log(`[pre_checkout] id=${pcq.id} user=${userId} payload=${(pcq as any).invoice_payload} amount=${(pcq as any).total_amount} — answering ok:true`)
 
       try {
         const res = await altgram.answerPreCheckoutQuery({
@@ -401,11 +438,20 @@ async function handleTextMessage(msg: TgMessage) {
   const head = parts[0] ?? ''
   const cmd = (head.split('@')[0] ?? '').toLowerCase()
 
-  // Handle /start with referral
+  // Handle /start with deep-link params
   if (cmd === '/start') {
     const arg = parts[1]
     if (arg && arg.startsWith('ref_')) {
       await handleStartWithRef(msg, user, arg)
+      return
+    }
+    // /start=topup — пользователь перешёл из группы для пополнения
+    if (arg === 'topup') {
+      await handleTopup(msg, user, undefined)
+      return
+    }
+    if (arg === 'balance') {
+      await sendBalanceWithButtons(msg.chat.id, user)
       return
     }
     await sendWelcome(msg, user)
@@ -847,8 +893,29 @@ async function handleTopup(
   user: { id: string; tgId: string; balance: number },
   amountArg?: string
 ) {
+  // Если команда в группе — отправляем инвойс в личку юзеру,
+  // а в группе просто уведомляем.
   if (!isPrivate(msg)) {
-    await send(msg.chat.id, '🔒 Пополнить можно только в личке с ботом. Напиши мне в ЛС.')
+    const amount = parseAmount(amountArg)
+    if (amount && amount >= 1 && amount <= 10000) {
+      // Сразу создаём инвойс в ЛС
+      try {
+        await sendInvoice(user, amount)
+        await send(msg.chat.id, `✅ Инвойс на **${amount}⭐** отправлен тебе в ЛС @duelsbot.\n\nОткрой личку с ботом чтобы оплатить.`)
+      } catch (e) {
+        console.error('[topup-group] sendInvoice failed:', e)
+        await send(msg.chat.id, '⚠️ Не удалось создать инвойс. Напиши мне в ЛС: @duelsbot')
+      }
+      return
+    }
+    // Без суммы — даём URL-кнопку для перехода в ЛС
+    const botUsername = 'duelsbot'
+    const kb: TgInlineKeyboardMarkup = {
+      inline_keyboard: [[
+        { text: '💳 Пополнить в ЛС', url: `https://t.me/${botUsername}?start=topup` },
+      ]],
+    }
+    await send(msg.chat.id, '💳 **Пополнение баланса**\n\nНажми кнопку ниже чтобы открыть бота в личке и выбрать сумму:', kb)
     return
   }
   const amount = parseAmount(amountArg)
@@ -864,6 +931,10 @@ async function handleTopup(
         [
           { text: '500⭐', callback_data: 'topup:500' },
           { text: '1000⭐', callback_data: 'topup:1000' },
+        ],
+        [
+          { text: '2000⭐', callback_data: 'topup:2000' },
+          { text: '5000⭐', callback_data: 'topup:5000' },
         ],
       ],
     }
@@ -885,6 +956,26 @@ async function sendInvoice(user: { id: string; tgId: string }, amount: number) {
   })
   if (!res.ok) {
     await send(user.tgId, '⚠️ Не удалось создать инвойс. Попробуйте позже.')
+    return
+  }
+  // ⚠️ AltGram НЕ присылает successful_payment — вместо этого после оплаты
+  // шлёт callback __invoice_pay:<id> по message_id инвойса.
+  // Сохраняем mapping msgId → (userId, amount), чтобы при оплате
+  // начислить звёзды правильному юзеру.
+  if (res.result?.message_id) {
+    try {
+      await db.invoice.create({
+        data: {
+          msgId: res.result.message_id,
+          userId: user.id,
+          amount,
+          status: 'pending',
+        },
+      })
+      console.log(`[invoice] saved msgId=${res.result.message_id} user=${user.tgId} amount=${amount}`)
+    } catch (e) {
+      console.error('[invoice] save failed:', e)
+    }
   }
 }
 
@@ -916,41 +1007,14 @@ async function handleSuccessfulPayment(msg: TgMessage) {
       return
     }
 
-    await creditBalance(userId, amount, 'deposit', `Пополнение (${sp.telegram_payment_charge_id || 'paid'})`)
+    // Дедупликация с __invoice_pay callback: помечаем все pending инвойсы
+    // этого юзера на эту сумму как paid — чтобы callback их пропустил.
+    await db.invoice.updateMany({
+      where: { userId, amount, status: 'pending' },
+      data: { status: 'paid' },
+    })
 
-    const u = await db.user.findUnique({ where: { id: userId }, include: { referrer: true } })
-    if (u?.referrer) {
-      // Базовый бонус: 5% от пополнения
-      const bonus = Math.floor(amount * 0.05)
-      if (bonus > 0) {
-        await creditBalance(u.referrer.id, bonus, 'referral', `5% от пополнения реферала`)
-      }
-
-      // Feature #15: Реферальный буст — 10 рефералов → +50⭐ + 10% от их игр
-      const referralCount = await db.user.count({ where: { referredById: u.referrer.id } })
-      if (referralCount === 10) {
-        // Достиг 10 рефералов — бонус 50⭐
-        const alreadyRewarded = await db.transaction.findFirst({
-          where: { userId: u.referrer.id, type: 'referral_milestone', note: { contains: '10' } },
-        })
-        if (!alreadyRewarded) {
-          await creditBalance(u.referrer.id, 50, 'referral_milestone', 'Бонус за 10 рефералов!')
-          try {
-            await send(u.referrer.tgId, `🎉 **Бонус за 10 рефералов!** +50⭐ на баланс!\nТеперь вы получаете 10% от всех игр рефералов!`)
-          } catch { /* ignore */ }
-        }
-      }
-
-      // Если у реферера 10+ рефералов — 10% от пополнения вместо 5%
-      if (referralCount >= 10) {
-        const extraBonus = Math.floor(amount * 0.05) // ещё 5% сверху
-        if (extraBonus > 0) {
-          await creditBalance(u.referrer.id, extraBonus, 'referral_boost', `Доп. 5% (буст за 10+ рефералов)`)
-        }
-      }
-    }
-
-    const newBal = (await db.user.findUnique({ where: { id: userId } }))?.balance ?? 0
+    const newBal = await grantDeposit(userId, amount, `Пополнение (${sp.telegram_payment_charge_id || 'paid'})`)
     await send(msg.chat.id, `✅ Зачислено **${amount}⭐**!\nТекущий баланс: **${newBal}⭐**`)
     return
   }
@@ -1617,6 +1681,62 @@ async function cancelDuel(
 
 async function handleCallbackQuery(cq: TgCallbackQuery) {
   const data = cq.data ?? ''
+
+  // INVOICE PAY — AltGram после успешной оплаты редактирует сообщение
+  // ("✅ Payment successful"), зачисляет звёзды на баланс бота и шлёт
+  // этот callback по message_id инвойса. Здесь начисляем юзеру.
+  if (data.startsWith('__invoice_pay') || data.startsWith('invoice_pay')) {
+    console.log('========== INVOICE PAY CALLBACK ==========')
+    console.log('data:', data)
+    console.log('cq.id:', cq.id)
+    console.log('cq.from.id:', cq.from?.id)
+    console.log('cq.message.message_id:', cq.message?.message_id)
+
+    const msgId = cq.message?.message_id
+    try { await altgram.answerCallbackQuery({ callback_query_id: cq.id }) } catch { /* expired — ignore */ }
+
+    if (!msgId) {
+      console.log('[invoice_pay] NO message_id — cannot match invoice')
+      return
+    }
+
+    // Найти invoice по message_id
+    const invoice = await db.invoice.findUnique({ where: { msgId } })
+    if (!invoice) {
+      console.log(`[invoice_pay] invoice NOT FOUND for msgId=${msgId} (payer=${cq.from?.id})`)
+      // Сообщим юзеру что платёж получен, но требуется ручная проверка
+      try {
+        await send(cq.from.id,
+          `✅ Оплата получена!\n\n⚠️ Не удалось автоматически определить сумму (старый инвойс).\nОбратись к админу — зачислим вручную.`)
+      } catch { /* ignore */ }
+      return
+    }
+
+    // Атомарная дедупликация: только один вызов обрабатывает оплату
+    const claim = await db.invoice.updateMany({
+      where: { id: invoice.id, status: 'pending' },
+      data: { status: 'paid' },
+    })
+    if (claim.count === 0) {
+      console.log(`[invoice_pay] invoice msgId=${msgId} already processed — skip`)
+      return
+    }
+
+    // Начисляем юзеру
+    const user = await db.user.findUnique({ where: { id: invoice.userId } })
+    if (!user) {
+      console.error(`[invoice_pay] user ${invoice.userId} not found for paid invoice msgId=${msgId}`)
+      return
+    }
+
+    const newBal = await grantDeposit(user.id, invoice.amount, `Пополнение (invoice ${msgId})`)
+    console.log(`[invoice_pay] credited ${invoice.amount}⭐ to user=${user.tgId} → balance=${newBal}`)
+
+    try {
+      await send(user.tgId, `✅ Зачислено **${invoice.amount}⭐**!\nТекущий баланс: **${newBal}⭐**`)
+    } catch { /* ignore */ }
+    return
+  }
 
   // ОТВЕЧАЕМ НА CALLBACK НЕМЕДЛЕННО — AltGram истекает через ~5 секунд
   const callbackAnswers: Record<string, string> = {
