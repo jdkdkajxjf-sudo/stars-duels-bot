@@ -319,23 +319,54 @@ async function grantDeposit(userId: string, amount: number, note: string): Promi
   // Реферальный бонус рефереру
   const withRef = await db.user.findUnique({ where: { id: userId }, include: { referrer: true } })
   if (withRef?.referrer) {
-    const referralCount = await db.user.count({ where: { referredById: withRef.referrer.id } })
+    const referrer = withRef.referrer  // capture narrowed referrer for closures below
+    const referralCount = await db.user.count({ where: { referredById: referrer.id } })
     const rate = referralCount >= 10 ? 0.10 : 0.05
     const bonus = Math.floor(amount * rate)
     if (bonus > 0) {
-      await creditBalance(withRef.referrer.id, bonus, 'referral', `${Math.round(rate * 100)}% от пополнения реферала (${amount}⭐)`)
+      await creditBalance(referrer.id, bonus, 'referral', `${Math.round(rate * 100)}% от пополнения реферала (${amount}⭐)`)
     }
 
-    // Milestone: ровно 10 рефералов → +50⭐ разовый бонус
-    if (referralCount === 10) {
-      const already = await db.transaction.findFirst({
-        where: { userId: withRef.referrer.id, type: 'referral_milestone' },
-      })
-      if (!already) {
-        await creditBalance(withRef.referrer.id, 50, 'referral_milestone', 'Бонус за 10 рефералов!')
-        try {
-          await send(withRef.referrer.tgId, `🎉 **Бонус за 10 рефералов!** +50⭐ на баланс!\nТеперь вы получаете 10% от пополнений рефералов!`)
-        } catch { /* ignore */ }
+    // FIX C13: Milestone race protection — wrap check+credit in a single tx
+    // with a SELECT FOR UPDATE on the referrer row to serialize concurrent calls.
+    // PostgreSQL default isolation (READ COMMITTED) cannot prevent the race otherwise.
+    if (referralCount >= 10) {
+      try {
+        const referrerId = referrer.id
+        const referrerTgId = referrer.tgId
+        const milestoneResult = await db.$transaction(async (tx) => {
+          // Lock the referrer row — two concurrent tx's serialize here.
+          await tx.$queryRaw`SELECT * FROM "User" WHERE "id" = ${referrerId} FOR UPDATE`
+          const already = await tx.transaction.findFirst({
+            where: { userId: referrerId, type: 'referral_milestone' },
+          })
+          if (already) return { granted: false }
+          // Re-count referrals inside tx for safety
+          const count = await tx.user.count({ where: { referredById: referrerId } })
+          if (count < 10) return { granted: false }
+          // Inline credit logic (avoid nested $transaction from creditBalance)
+          const refUser = await tx.user.update({
+            where: { id: referrerId },
+            data: { balance: { increment: 50 } },
+          })
+          await tx.transaction.create({
+            data: {
+              userId: referrerId,
+              type: 'referral_milestone',
+              amount: 50,
+              balanceAfter: refUser.balance,
+              note: 'Бонус за 10 рефералов!',
+            },
+          })
+          return { granted: true }
+        })
+        if (milestoneResult.granted) {
+          try {
+            await send(referrerTgId, `🎉 **Бонус за 10 рефералов!** +50⭐ на баланс!\nТеперь вы получаете 10% от пополнений рефералов!`)
+          } catch { /* ignore */ }
+        }
+      } catch (e) {
+        console.error('[grantDeposit] milestone race:', e)
       }
     }
   }
@@ -474,7 +505,7 @@ async function handleTextMessage(msg: TgMessage) {
             balance: 0,
           },
         })
-        await send(msg.chat.id, `✅ Юзер добавлен в БД: @${forwardFrom.username ?? forwardFrom.first_name ?? fwdId} (tgId: ${fwdId})\n\nТеперь вы можете отправить ему gift:\n\`/sendgift @${(forwardFrom.username ?? fwdId).toLowerCase()} 666 1\``)
+        await send(msg.chat.id, `✅ Юзер добавлен в БД: @${forwardFrom.username ?? forwardFrom.first_name ?? fwdId} (tgId: ${fwdId})\n\nТеперь вы можете начислить ему звёзды:\n\`/give @${(forwardFrom.username ?? fwdId).toLowerCase()} 666\``)
       } else {
         await send(msg.chat.id, `ℹ️ Юзер @${existing.username ?? existing.firstName ?? fwdId} уже в БД.`)
       }
@@ -575,9 +606,6 @@ async function handleTextMessage(msg: TgMessage) {
     case '/donate':
       await handleDonate(msg, user, parts[1])
       break
-    case '/sendgift':
-      await handleSendGift(msg, user, parts.slice(1))
-      break
     case '/adminstats':
       await handleAdminStats(msg, user)
       break
@@ -586,6 +614,15 @@ async function handleTextMessage(msg: TgMessage) {
       break
     case '/give':
       await handleGive(msg, user, parts[1], parts[2])
+      break
+    case '/pending':
+      await handlePending(msg, user)
+      break
+    case '/approve':
+      await handleApprove(msg, user, parts[1])
+      break
+    case '/reject':
+      await handleReject(msg, user, parts[1])
       break
     case '/broadcast':
       await handleBroadcast(msg, user, parts.slice(1).join(' '))
@@ -627,7 +664,7 @@ async function handleListUsers(
   await send(
     msg.chat.id,
     `📋 **Юзеры в БД (${users.length}):**\n\n${lines.join('\n')}\n\nИспользуйте:\n` +
-    `\`/sendgift <username> <amount> <count>\` — для отправки gift`
+    `\`/give <username> <amount>\` — для ручного начисления звёзд`
   )
 }
 
@@ -661,7 +698,7 @@ async function handleMakeAdmin(
   })
   await send(msg.chat.id, `✅ @${username} назначен админом!`)
   try {
-    await send(target.tgId, `👑 Вы назначены админом бота!\n\nТеперь вам доступны команды:\n• /listusers\n• /sendgift @user 1000 5\n• /give @user 100\n• /adminstats\n• /broadcast текст\n• /makeadmin @user`)
+    await send(target.tgId, `👑 Вы назначены админом бота!\n\nТеперь вам доступны команды:\n• /listusers\n• /give @user 100 — начислить звёзды\n• /pending — заявки на вывод\n• /approve <id> — одобрить вывод\n• /reject <id> — отклонить вывод (вернуть звёзды)\n• /adminstats\n• /broadcast текст\n• /makeadmin @user`)
   } catch { /* ignore */ }
 }
 
@@ -672,13 +709,20 @@ async function handleMakeAdmin(
 async function handleStartWithRef(msg: TgMessage, user: { id: string; tgId: string; username: string | null; firstName: string | null; balance: number; isAdmin: boolean; referredById: string | null }, refArg: string) {
   const code = refArg.slice(4)
   const referrer = await db.user.findUnique({ where: { referralCode: code } })
-  if (referrer && !user.referredById && referrer.tgId !== user.tgId) {
-    await db.user.update({ where: { id: user.id }, data: { referredById: referrer.id } })
-    await creditBalance(referrer.id, 5, 'referral', `Реферал ${user.username || user.firstName} зарегистрировался`)
-    try {
-      const refBal = (await db.user.findUnique({ where: { id: referrer.id } }))?.balance ?? 0
-      await send(referrer.tgId, `🎁 Новый реферал! **${user.username ? '@' + user.username : user.firstName || 'Игрок'}** зарегистрировался.\n+5⭐ на баланс.\nБаланс: ${refBal}⭐`)
-    } catch { /* ignore */ }
+  if (referrer && referrer.tgId !== user.tgId) {
+    // FIX C12: Atomic conditional update — only credit referrer if referredById was null.
+    // Prevents double-credit on concurrent /start ref_ calls (e.g., webhook retries).
+    const updated = await db.user.updateMany({
+      where: { id: user.id, referredById: null },
+      data: { referredById: referrer.id },
+    })
+    if (updated.count > 0) {
+      await creditBalance(referrer.id, 5, 'referral', `Реферал ${user.username || user.firstName} зарегистрировался`)
+      try {
+        const refBal = (await db.user.findUnique({ where: { id: referrer.id } }))?.balance ?? 0
+        await send(referrer.tgId, `🎁 Новый реферал! **${user.username ? '@' + user.username : user.firstName || 'Игрок'}** зарегистрировался.\n+5⭐ на баланс.\nБаланс: ${refBal}⭐`)
+      } catch { /* ignore */ }
+    }
   }
   await sendWelcome(msg, user)
 }
@@ -985,6 +1029,19 @@ async function handleSuccessfulPayment(msg: TgMessage) {
   const payload = sp.invoice_payload
   if (!payload) return
 
+  // FIX C14: charge_id-based dedup (consistent fallback in both places).
+  const chargeId = sp.telegram_payment_charge_id
+  if (chargeId) {
+    const existing = await db.transaction.findFirst({
+      where: { note: { contains: chargeId } },
+    })
+    if (existing) {
+      console.log(`[successful_payment] already credited for charge ${chargeId} — skip`)
+      return
+    }
+  }
+  const paidChargeId = chargeId || 'paid'
+
   // topup:user_id:amount  OR  duel:duelId:tgId
   if (payload.startsWith('topup:')) {
     const [, userId, amountStr] = payload.split(':')
@@ -994,27 +1051,23 @@ async function handleSuccessfulPayment(msg: TgMessage) {
     const user = await db.user.findUnique({ where: { id: userId } })
     if (!user) return
 
-    const existing = await db.transaction.findFirst({
-      where: {
-        userId,
-        type: 'deposit',
-        amount,
-        note: { contains: sp.telegram_payment_charge_id || 'unknown' },
-      },
-    })
-    if (existing) {
-      await send(msg.chat.id, '✅ Этот платёж уже зачислен.')
-      return
+    // FIX C15: Match the invoice by message_id (not amount+user) — prevents
+    // marking ALL pending invoices of same amount as paid.
+    if (msg.message_id) {
+      const inv = await db.invoice.findUnique({ where: { msgId: msg.message_id } })
+      if (inv) {
+        const claim = await db.invoice.updateMany({
+          where: { id: inv.id, status: 'pending' },
+          data: { status: 'paid' },
+        })
+        if (claim.count === 0) {
+          // Already processed by __invoice_pay callback — skip.
+          return
+        }
+      }
     }
 
-    // Дедупликация с __invoice_pay callback: помечаем все pending инвойсы
-    // этого юзера на эту сумму как paid — чтобы callback их пропустил.
-    await db.invoice.updateMany({
-      where: { userId, amount, status: 'pending' },
-      data: { status: 'paid' },
-    })
-
-    const newBal = await grantDeposit(userId, amount, `Пополнение (${sp.telegram_payment_charge_id || 'paid'})`)
+    const newBal = await grantDeposit(userId, amount, `Пополнение (${paidChargeId})`)
     await send(msg.chat.id, `✅ Зачислено **${amount}⭐**!\nТекущий баланс: **${newBal}⭐**`)
     return
   }
@@ -1031,18 +1084,18 @@ async function handleSuccessfulPayment(msg: TgMessage) {
     const duel = await db.duel.findUnique({ where: { id: duelId } })
     if (!duel || duel.amount <= 0) return
 
-    // Idempotency: check if already paid
+    // Idempotency: check if already paid (uses same chargeId fallback)
     const existing = await db.transaction.findFirst({
       where: {
         userId: u.id,
         type: 'duel_bet',
         duelId,
-        note: { contains: sp.telegram_payment_charge_id || 'unknown' },
+        note: { contains: paidChargeId },
       },
     })
     if (existing) return
 
-    await creditBalance(u.id, duel.amount, 'deposit', `Оплата дуэли через Stars (${sp.telegram_payment_charge_id || 'paid'})`, duelId)
+    await creditBalance(u.id, duel.amount, 'deposit', `Оплата дуэли через Stars (${paidChargeId})`, duelId)
     await debitBalance(u.id, duel.amount, 'duel_bet', `Ставка за дуэль ${duelId.slice(-8)}`, duelId)
 
     await send(u.tgId, `✅ Оплата принята. Ожидаем второго игрока...`)
@@ -1072,7 +1125,7 @@ async function sendCashoutMenu(chatId: number | string) {
   }
   await send(
     chatId,
-    '💸 **Вывод звёзд через Telegram Gift**\n\nПодарок придёт сразу!\nДоступные суммы: 50, 100, 500, **666** 👹, 1000⭐.',
+    '💸 **Вывод звёзд**\n\nЗаявка обрабатывается админом вручную (до 24ч). Сумма списывается сразу, возвращается при отклонении.',
     kb
   )
 }
@@ -1096,23 +1149,8 @@ async function handleWithdraw(
 }
 
 /* ------------------------------------------------------------------ */
-/* /withdrawall — вывести весь баланс максимально возможными gifts      */
+/* /withdrawall — вывести весь баланс одной заявкой (manual admin)    */
 /* ------------------------------------------------------------------ */
-
-// Жадный алгоритм — разбить сумму на максимальные gifts
-function breakdownAmount(total: number): { amount: number; count: number }[] {
-  const denoms = [1000, 666, 500, 100, 75, 50, 25, 15]  // от большего к меньшему
-  const result: { amount: number; count: number }[] = []
-  let remaining = total
-  for (const d of denoms) {
-    if (remaining >= d) {
-      const count = Math.floor(remaining / d)
-      result.push({ amount: d, count })
-      remaining -= d * count
-    }
-  }
-  return result
-}
 
 async function handleWithdrawAll(
   msg: TgMessage,
@@ -1128,12 +1166,6 @@ async function handleWithdrawAll(
     return
   }
 
-  const breakdown = breakdownAmount(balance)
-  const totalToWithdraw = breakdown.reduce((s, b) => s + b.amount * b.count, 0)
-  const remainder = balance - totalToWithdraw
-
-  // Подтверждение
-  const lines = breakdown.map(b => `• ${b.amount}⭐ × ${b.count} = ${b.amount * b.count}⭐`).join('\n')
   const kb: TgInlineKeyboardMarkup = {
     inline_keyboard: [[
       { text: '✅ Подтвердить вывод', callback_data: `withdrawall_ok` },
@@ -1143,16 +1175,14 @@ async function handleWithdrawAll(
   await send(
     msg.chat.id,
     [
-      `💸 **Массовый вывод ${balance}⭐**`,
+      `💸 **Вывод всего баланса: ${balance}⭐**`,
       ``,
-      `Будет отправлено:`,
-      lines,
-      ``,
-      `Итого: ${totalToWithdraw}⭐`,
-      remainder > 0 ? `Остаток на балансе: ${remainder}⭐ (меньше 15⭐ — нельзя вывести)` : '',
+      `Сумма будет списана сразу и создана заявка на вывод.`,
+      `Админ обработает вручную в течение 24 часов.`,
+      `При отклонении — звёзды вернутся на баланс.`,
       ``,
       `Подтвердите вывод:`,
-    ].filter(Boolean).join('\n'),
+    ].join('\n'),
     kb
   )
 }
@@ -1168,121 +1198,8 @@ async function handleWithdrawAllConfirm(cq: TgCallbackQuery) {
     await send(cq.from!.id, `❌ Недостаточно звёзд. Баланс: ${balance}⭐`)
     return
   }
-
-  const breakdown = breakdownAmount(balance)
-  if (breakdown.length === 0) {
-    await send(cq.from!.id, `❌ Невозможно разбить ${balance}⭐ на gifts.`)
-    return
-  }
-
-  await send(cq.from!.id, `⏳ Отправляю ${breakdown.length} разных gifts...`)
-
-  let totalSent = 0
-  let totalFailed = 0
-  const details: string[] = []
-
-  for (const b of breakdown) {
-    if (user.balance < b.amount * b.count) {
-      // Если не хватает на весь пакет — выводим сколько можем
-      const possible = Math.floor(user.balance / b.amount)
-      if (possible <= 0) continue
-      const { sent, failed } = await sendGiftToUser(user.tgId, b.amount, possible)
-      totalSent += sent
-      totalFailed += failed
-      if (sent > 0) {
-        // Списываем
-        try {
-          await db.$transaction(async (tx) => {
-            const fresh = await tx.user.findUnique({ where: { id: user.id } })
-            if (!fresh) throw new Error('user_missing')
-            const cost = b.amount * sent
-            if (fresh.balance < cost) throw new Error('insufficient_balance')
-            const u = await tx.user.update({
-              where: { id: user.id },
-              data: { balance: { decrement: cost } },
-            })
-            await tx.transaction.create({
-              data: {
-                userId: user.id,
-                type: 'withdraw',
-                amount: -cost,
-                balanceAfter: u.balance,
-                note: `Вывод ${cost}⭐ (${sent}×${b.amount} gifts)`,
-              },
-            })
-          })
-          await db.withdrawal.create({
-            data: { userId: user.id, amount: b.amount * sent, status: 'fulfilled', note: `${sent}×${b.amount}⭐ gifts`, fulfilledAt: new Date() },
-          })
-          details.push(`✅ ${b.amount}⭐ × ${sent}`)
-        } catch (e) {
-          // Возврат gifts невозможен — но хотя бы залогируем
-          details.push(`⚠️ ${b.amount}⭐ × ${sent} (баланс не списан!)`)
-        }
-      }
-      if (failed > 0) details.push(`❌ ${b.amount}⭐ × ${failed} (не отправлено)`)
-    } else {
-      const cost = b.amount * b.count
-      // Списываем сразу атомарно
-      try {
-        await db.$transaction(async (tx) => {
-          const fresh = await tx.user.findUnique({ where: { id: user.id } })
-          if (!fresh) throw new Error('user_missing')
-          if (fresh.balance < cost) throw new Error('insufficient_balance')
-          const u = await tx.user.update({
-            where: { id: user.id },
-            data: { balance: { decrement: cost } },
-          })
-          await tx.transaction.create({
-            data: {
-              userId: user.id,
-              type: 'withdraw',
-              amount: -cost,
-              balanceAfter: u.balance,
-              note: `Вывод ${cost}⭐ (${b.count}×${b.amount} gifts)`,
-            },
-          })
-        })
-      } catch (e) {
-        details.push(`❌ ${b.amount}⭐ × ${b.count} (баланс изменился)`)
-        continue
-      }
-      const { sent, failed } = await sendGiftToUser(user.tgId, b.amount, b.count)
-      totalSent += sent
-      totalFailed += failed
-      if (sent > 0) {
-        await db.withdrawal.create({
-          data: { userId: user.id, amount: b.amount * sent, status: 'fulfilled', note: `${sent}×${b.amount}⭐ gifts`, fulfilledAt: new Date() },
-        })
-        details.push(`✅ ${b.amount}⭐ × ${sent}`)
-      }
-      if (failed > 0) {
-        // Возвращаем за неудавшиеся
-        await creditBalance(user.id, b.amount * failed, 'refund', `Возврат ${b.amount}⭐ × ${failed} — gift не отправлен`)
-        await db.withdrawal.create({
-          data: { userId: user.id, amount: b.amount * failed, status: 'failed', note: `${failed}×${b.amount}⭐ gifts не отправлены` },
-        })
-        details.push(`❌ ${b.amount}⭐ × ${failed} (возврат)`)
-      }
-    }
-    // Обновим user.balance из БД
-    const fresh = await db.user.findUnique({ where: { id: user.id } })
-    if (fresh) user.balance = fresh.balance
-  }
-
-  const freshBal = (await db.user.findUnique({ where: { id: user.id } }))?.balance ?? 0
-  await send(
-    cq.from!.id,
-    [
-      `🎁 **Массовый вывод завершён!**`,
-      ``,
-      ...details,
-      ``,
-      `✅ Отправлено gifts: ${totalSent}`,
-      `❌ Не удалось: ${totalFailed}`,
-      `💰 Остаток на балансе: ${freshBal}⭐`,
-    ].join('\n')
-  )
+  // Single pending withdrawal for the entire balance — admin processes manually.
+  await processWithdrawal(user, balance, cq.from!.id)
 }
 
 /* ------------------------------------------------------------------ */
@@ -1317,80 +1234,20 @@ async function handleWithdrawals(
   )
 }
 
-// Рабочие gift_id (протестированы 03.09.2026 — обновлено с новыми NFT)
-const GIFT_IDS_15 = ['9000000000000001', '9000000000000006']
-const GIFT_IDS_25 = ['9000000000000007', '9000000000000028', '9000000000000030']
-const GIFT_IDS_50 = ['9000000000000005', '9000000000000008', '9000000000000009', '9000000000000013', '9000000000000033', '9000000000000041']
-const GIFT_IDS_75 = ['9000000000000031']
-const GIFT_IDS_100 = ['9000000000000010', '9000000000000011', '9000000000000012', '9000000000000036', '9000000000000039']
-const GIFT_IDS_500 = ['9000000000000029', '9000000000000035', '9000000000000040']
-const GIFT_IDS_666 = ['9000000000000042']  // 👹 Demon Seal — новый NFT за 666⭐
-const GIFT_IDS_1000 = ['9000000000000037']
-
-function getGiftIdsForAmount(amount: number): string[] | null {
-  switch (amount) {
-    case 15: return GIFT_IDS_15
-    case 25: return GIFT_IDS_25
-    case 50: return GIFT_IDS_50
-    case 75: return GIFT_IDS_75
-    case 100: return GIFT_IDS_100
-    case 500: return GIFT_IDS_500
-    case 666: return GIFT_IDS_666
-    case 1000: return GIFT_IDS_1000
-    default: return null
-  }
-}
-
-/** Отправить gift юзеру. Возвращает true если успешно. */
-async function sendGiftToUser(tgId: string, amount: number, count: number = 1): Promise<{ sent: number; failed: number }> {
-  const giftIds = getGiftIdsForAmount(amount)
-  console.log(`[sendGift] start tgId=${tgId} amount=${amount} count=${count} giftIds=${JSON.stringify(giftIds)}`)
-  if (!giftIds) {
-    console.log(`[sendGift] no giftIds for amount=${amount} → returning 0 sent, ${count} failed`)
-    return { sent: 0, failed: count }
-  }
-
-  let sent = 0
-  let failed = 0
-
-  for (let i = 0; i < count; i++) {
-    let giftSent = false
-    for (const giftId of giftIds) {
-      // Отправляем БЕЗ text — скрытно, не оставляет следов в чате
-      const res = await altgram.sendGift({
-        user_id: Number(tgId),
-        gift_id: giftId,
-      })
-      if (res.ok) {
-        giftSent = true
-        break
-      }
-    }
-    if (giftSent) {
-      sent++
-    } else {
-      failed++
-    }
-  }
-
-  return { sent, failed }
-}
+/* ------------------------------------------------------------------ */
+/* processWithdrawal — manual admin approval flow                       */
+/* (AltGram sendGift API is broken — admin processes withdrawals by hand) */
+/* ------------------------------------------------------------------ */
 
 async function processWithdrawal(
   user: { id: string; tgId: string; balance: number; username: string | null; firstName: string | null },
   amount: number,
   chatId: number | string
 ) {
-  if (user.balance < amount) {
-    await send(chatId, `❌ Недостаточно звёзд. Ваш баланс: ${user.balance}⭐.`)
-    return
-  }
-
-  // АТОМАРНОЕ списание в транзакции — защита от race condition
-  // Если между проверкой и списанием юзер успел вывести ещё раз — баланс уже изменится
-  let debited = false
+  // 1. Atomic debit + create pending withdrawal in ONE transaction
+  let result: { withdrawalId: string; newBalance: number }
   try {
-    await db.$transaction(async (tx) => {
+    result = await db.$transaction(async (tx) => {
       const fresh = await tx.user.findUnique({ where: { id: user.id } })
       if (!fresh) throw new Error('user_missing')
       if (fresh.balance < amount) throw new Error('insufficient_balance')
@@ -1404,65 +1261,58 @@ async function processWithdrawal(
           type: 'withdraw',
           amount: -amount,
           balanceAfter: u.balance,
-          note: `Вывод ${amount}⭐ через gift`,
+          note: `Заявка на вывод ${amount}⭐ (pending)`,
         },
       })
+      const w = await tx.withdrawal.create({
+        data: {
+          userId: user.id,
+          amount,
+          status: 'pending',
+          note: `Manual withdrawal — ${user.username ? '@' + user.username : (user.firstName || user.tgId)}`,
+        },
+      })
+      return { withdrawalId: w.id, newBalance: u.balance }
     })
-    debited = true
   } catch (e) {
     const err = String(e)
     if (err.includes('insufficient_balance')) {
       await send(chatId, `❌ Недостаточно звёзд. Попробуйте ещё раз.`)
       return
     }
+    console.error('[withdrawal] error:', e)
     await send(chatId, '❌ Ошибка списания. Попробуйте позже.')
     return
   }
-  if (!debited) return
 
-  // Отправляем gift автоматически через sendGiftToUser
-  const { sent: giftSent, failed: giftFailed } = await sendGiftToUser(user.tgId, amount)
+  // 2. Notify user
+  await send(
+    chatId,
+    `⏳ **Заявка на вывод #${result.withdrawalId.slice(-8)} создана!**\n\n💸 Сумма: ${amount}⭐\n💰 Списано с баланса.\n📊 Новый баланс: ${result.newBalance}⭐\n\nАдмин обработает в течение 24 часов. Спасибо за терпение!`
+  )
 
-  if (giftSent) {
-    await db.withdrawal.create({
-      data: {
-        userId: user.id,
-        amount,
-        status: 'fulfilled',
-        note: `Gift отправлен автоматически`,
-        fulfilledAt: new Date(),
-      },
-    })
-
-    await send(
-      chatId,
-      `✅ **Вывод выполнен!**\n🎁 Подарок на ${amount}⭐ отправлен вам!\nПроверьте Telegram — подарок должен прийти.`
-    )
-  } else {
-    // Gift не отправился — возвращаем звёзды
-    await creditBalance(user.id, amount, 'refund', 'Возврат — gift не отправлен')
-    await db.withdrawal.create({
-      data: {
-        userId: user.id,
-        amount,
-        status: 'failed',
-        note: 'Gift не доступен — возврат средств',
-      },
-    })
-    await send(
-      chatId,
-      `❌ Не удалось отправить подарок. Звёзды возвращены на баланс.\nПопробуйте позже или обратитесь к админу.`
-    )
-  }
-
-  // Уведомить админа
-  const admin = await db.user.findFirst({ where: { isAdmin: true } })
-  if (admin) {
-    const senderName = user.username ? `@${user.username}` : user.firstName || `Игрок ${user.tgId.slice(-4)}`
-    await send(
-      admin.tgId,
-      `💸 Вывод: ${senderName} — ${amount}⭐ — ${giftSent ? '✅ выполнен' : '❌ не выполнен (возврат)'}`
-    )
+  // 3. Notify all admins with inline buttons
+  try {
+    const admins = await db.user.findMany({ where: { isAdmin: true } })
+    if (admins.length === 0) return
+    const senderName = user.username ? `@${user.username}` : (user.firstName || `tg:${user.tgId}`)
+    const kb: TgInlineKeyboardMarkup = {
+      inline_keyboard: [[
+        { text: '✅ Approve', callback_data: `admin_w_approve:${result.withdrawalId}` },
+        { text: '❌ Reject', callback_data: `admin_w_reject:${result.withdrawalId}` },
+      ]],
+    }
+    for (const admin of admins) {
+      try {
+        await send(
+          admin.tgId,
+          `📤 **Новая заявка на вывод**\n\n👤 Игрок: ${senderName} (tgId: ${user.tgId})\n💸 Сумма: ${amount}⭐\n🆔 ID: \`${result.withdrawalId}\`\n\nАдмин должен отправить звёзды вручную через реальный Telegram, затем нажать Approve.`,
+          kb
+        )
+      } catch { /* ignore */ }
+    }
+  } catch (e) {
+    console.error('[withdrawal] admin notify failed:', e)
   }
 }
 
@@ -1756,6 +1606,8 @@ async function handleCallbackQuery(cq: TgCallbackQuery) {
     'admin_promo': 'OK',
     'admin_stats': 'OK',
     'admin_broadcast': 'OK',
+    'admin_w_approve': 'OK',
+    'admin_w_reject': 'OK',
   }
 
   const action = data.split(':')[0]
@@ -1835,6 +1687,8 @@ async function handleCallbackQuery(cq: TgCallbackQuery) {
   }
   else if (act === 'admin_stats') await handleAdminStatsCallback(cq)
   else if (act === 'admin_broadcast') await handleAdminBroadcastCallback(cq)
+  else if (act === 'admin_w_approve') await handleAdminWithdrawApprove(cq, arg)
+  else if (act === 'admin_w_reject') await handleAdminWithdrawReject(cq, arg)
 }
 
 async function handleTopupCallback(cq: TgCallbackQuery, amountStr: string) {
@@ -2024,28 +1878,40 @@ async function handlePayDuel(cq: TgCallbackQuery, duelId: string) {
 async function markPaid(duelId: string, payerTgId: string) {
   const duel = await db.duel.findUnique({ where: { id: duelId } })
   if (!duel) return
-
   const isPlayer1 = duel.player1TgId === payerTgId
-  const paid1 = isPlayer1 || duel.paid1At
-  const paid2 = !isPlayer1 || duel.paid2At
 
-  await db.duel.update({
-    where: { id: duelId },
-    data: {
-      paid1At: paid1 ? new Date() : duel.paid1At,
-      paid2At: paid2 ? new Date() : duel.paid2At,
-      status: paid1 && paid2 ? 'paid' : duel.status,
-    },
+  // FIX C1: Atomic conditional update — only succeeds if field is still null.
+  // Two concurrent markPaid calls for the same player: only one wins.
+  const updated = await db.duel.updateMany({
+    where: { id: duelId, ...(isPlayer1 ? { paid1At: null } : { paid2At: null }) },
+    data: isPlayer1 ? { paid1At: new Date() } : { paid2At: new Date() },
   })
+  if (updated.count === 0) {
+    console.log(`[markPaid] race lost for duel ${duelId} player ${payerTgId}`)
+  }
+
+  // Re-fetch to check final state
+  const fresh = await db.duel.findUnique({ where: { id: duelId } })
+  if (!fresh) return
+
+  // Atomically transition to 'paid' only if both paid AND still 'accepted'.
+  // Two concurrent markPaid calls for different players: only one wins the transition.
+  if (fresh.paid1At && fresh.paid2At && fresh.status === 'accepted') {
+    const transitioned = await db.duel.updateMany({
+      where: { id: duelId, status: 'accepted' },
+      data: { status: 'paid' },
+    })
+    if (transitioned.count > 0) {
+      await send(payerTgId, `✅ Оплата принята. Бросаем кости...`)
+      await updateDuelProgress(duelId)
+      await rollDuel(duelId)
+      return
+    }
+    // Lost race to transition — someone else will roll
+  }
 
   await send(payerTgId, `✅ Оплата принята. Ожидаем второго игрока...`)
-
-  // Обновить прогресс-бар в чате
   await updateDuelProgress(duelId)
-
-  if (paid1 && paid2) {
-    await rollDuel(duelId)
-  }
 }
 
 /** Обновляет прогресс-бар оплаты в чате */
@@ -2086,7 +1952,10 @@ async function checkPayTimeout(duelId: string) {
   try {
     const duel = await db.duel.findUnique({ where: { id: duelId } })
     if (!duel) return
-    if (duel.status !== 'accepted' && duel.status !== 'paid') return
+    // FIX C2: Only cancel 'accepted' (not 'paid'/'rolling'/'finished').
+    // Cancelling 'paid' would double-refund + double-credit winner (race window
+    // between markPaid→status='paid' and rollDuel→status='rolling').
+    if (duel.status !== 'accepted') return
     await cancelDuel(duel, 'timeout')
   } catch (e) {
     console.error('[timeout/pay]', e)
@@ -2094,18 +1963,27 @@ async function checkPayTimeout(duelId: string) {
 }
 
 async function rollDuel(duelId: string) {
+  // FIX C3: Atomic transition paid → rolling. Only one caller wins.
+  // Two concurrent markPaid calls (both seeing paid1 && paid2) can both call rollDuel.
+  const transitioned = await db.duel.updateMany({
+    where: { id: duelId, status: 'paid' },
+    data: { status: 'rolling' },
+  })
+  if (transitioned.count === 0) {
+    console.log(`[rollDuel] lost race for duel ${duelId} (not in 'paid' state)`)
+    return
+  }
+
   const duel = await db.duel.findUnique({ where: { id: duelId } })
   if (!duel) return
-
-  await db.duel.update({ where: { id: duelId }, data: { status: 'rolling' } })
 
   const roll1 = [Math.floor(Math.random() * 6) + 1, Math.floor(Math.random() * 6) + 1, Math.floor(Math.random() * 6) + 1]
   const roll2 = [Math.floor(Math.random() * 6) + 1, Math.floor(Math.random() * 6) + 1, Math.floor(Math.random() * 6) + 1]
   const sum1 = roll1.reduce((a, b) => a + b, 0)
   const sum2 = roll2.reduce((a, b) => a + b, 0)
 
-  await db.duel.update({
-    where: { id: duelId },
+  await db.duel.updateMany({
+    where: { id: duelId, status: 'rolling' },
     data: {
       player1Roll: JSON.stringify(roll1),
       player2Roll: JSON.stringify(roll2),
@@ -2141,10 +2019,15 @@ async function rollDuel(duelId: string) {
     resultText = `🤝 **Ничья!** Ставки возвращены.`
   }
 
-  await db.duel.update({
-    where: { id: duelId },
+  // FIX C3: Atomic transition rolling → finished. Prevents double-prize on race.
+  const finished = await db.duel.updateMany({
+    where: { id: duelId, status: 'rolling' },
     data: { status: 'finished', winnerTgId, commission, finishedAt: new Date() },
   })
+  if (finished.count === 0) {
+    console.log(`[rollDuel] lost race to finish duel ${duelId}`)
+    return
+  }
 
   if (winnerTgId) {
     const winner = await db.user.findUnique({ where: { tgId: winnerTgId } })
@@ -2256,26 +2139,48 @@ async function handleDailyCallback(cq: TgCallbackQuery) {
 }
 
 async function doDaily(chatId: number | string, user: { id: string; balance: number }) {
-  const claim = await db.dailyClaim.findUnique({ where: { userId: user.id } })
   const now = new Date()
-  if (claim) {
-    const diff = now.getTime() - claim.lastClaim.getTime()
-    if (diff < DAY_MS) {
-      const waitMin = Math.ceil((DAY_MS - diff) / 60000)
-      await send(chatId, `⏱️ Уже забирали. Возвращайтесь через ${waitMin} мин.`)
-      return
+  try {
+    const existing = await db.dailyClaim.findUnique({ where: { userId: user.id } })
+    if (existing) {
+      const diff = now.getTime() - existing.lastClaim.getTime()
+      if (diff < DAY_MS) {
+        const waitMin = Math.ceil((DAY_MS - diff) / 60000)
+        await send(chatId, `⏱️ Уже забирали. Возвращайтесь через ${waitMin} мин.`)
+        return
+      }
+      const reset = diff > 2 * DAY_MS
+      const newStreak = reset ? 1 : existing.streak + 1
+      const reward = 2 + Math.min(newStreak, 7)
+
+      // FIX C11: Atomic conditional updateMany — only update if lastClaim hasn't changed.
+      // Two concurrent /daily calls both pass the time check, but only one wins the update.
+      const updated = await db.dailyClaim.updateMany({
+        where: { userId: user.id, lastClaim: existing.lastClaim },
+        data: { lastClaim: now, streak: newStreak },
+      })
+      if (updated.count === 0) {
+        await send(chatId, `⏱️ Уже забрали. Возвращайтесь завтра.`)
+        return
+      }
+      await creditBalance(user.id, reward, 'daily', `Daily bonus day ${newStreak}`)
+      await send(chatId, `🎁 **+${reward}⭐**!\nСтрик: ${newStreak} 🔥\nБаланс: ${(await db.user.findUnique({ where: { id: user.id } }))?.balance ?? 0}⭐`)
+    } else {
+      const reward = 3
+      // FIX C11: Race protection — if two concurrent /daily calls both see no existing claim,
+      // the second create will fail due to @@unique(userId) on DailyClaim.
+      try {
+        await db.dailyClaim.create({ data: { userId: user.id, lastClaim: now, streak: 1 } })
+      } catch {
+        await send(chatId, `⏱️ Уже забрали. Возвращайтесь завтра.`)
+        return
+      }
+      await creditBalance(user.id, reward, 'daily', 'Daily bonus day 1')
+      await send(chatId, `🎁 **+${reward}⭐**!\nСтрик: 1 🔥\nБаланс: ${(await db.user.findUnique({ where: { id: user.id } }))?.balance ?? 0}⭐`)
     }
-    const reset = diff > 2 * DAY_MS
-    const newStreak = reset ? 1 : claim.streak + 1
-    const reward = 2 + Math.min(newStreak, 7)
-    await db.dailyClaim.update({ where: { userId: user.id }, data: { lastClaim: now, streak: newStreak } })
-    await creditBalance(user.id, reward, 'daily', `Daily bonus day ${newStreak}`)
-    await send(chatId, `🎁 **+${reward}⭐**!\nСтрик: ${newStreak} 🔥\nБаланс: ${(await db.user.findUnique({ where: { id: user.id } }))?.balance ?? 0}⭐`)
-  } else {
-    const reward = 3
-    await db.dailyClaim.create({ data: { userId: user.id, lastClaim: now, streak: 1 } })
-    await creditBalance(user.id, reward, 'daily', 'Daily bonus day 1')
-    await send(chatId, `🎁 **+${reward}⭐**!\nСтрик: 1 🔥\nБаланс: ${(await db.user.findUnique({ where: { id: user.id } }))?.balance ?? 0}⭐`)
+  } catch (e) {
+    console.error('[daily]', e)
+    await send(chatId, '❌ Ошибка получения бонуса.')
   }
 }
 
@@ -2414,15 +2319,30 @@ async function handlePromo(
       if (!promo) throw new Error('not_found')
       if (!promo.isActive) throw new Error('inactive')
       if (promo.expiresAt && promo.expiresAt < new Date()) throw new Error('expired')
-      if (promo.maxUses !== -1 && promo.usedCount >= promo.maxUses) throw new Error('max_uses_reached')
 
+      // Idempotent redemption: check + create via unique constraint (handles race)
       const existing = await tx.promoRedemption.findUnique({
         where: { promoId_userId: { promoId: promo.id, userId: user.id } },
       })
       if (existing) throw new Error('already_redeemed')
 
+      // FIX C10: Atomic increment with maxUses guard (race protection).
+      // updateMany with WHERE usedCount < maxUses is atomic in Postgres.
+      if (promo.maxUses !== -1) {
+        const updated = await tx.promoCode.updateMany({
+          where: { id: promo.id, usedCount: { lt: promo.maxUses } },
+          data: { usedCount: { increment: 1 } },
+        })
+        if (updated.count === 0) throw new Error('max_uses_reached')
+      } else {
+        // Unlimited uses — just increment (no constraint)
+        await tx.promoCode.update({
+          where: { id: promo.id },
+          data: { usedCount: { increment: 1 } },
+        })
+      }
+
       await tx.promoRedemption.create({ data: { promoId: promo.id, userId: user.id } })
-      await tx.promoCode.update({ where: { id: promo.id }, data: { usedCount: { increment: 1 } } })
       const u = await tx.user.update({ where: { id: user.id }, data: { balance: { increment: promo.starsReward } } })
       await tx.transaction.create({
         data: { userId: user.id, type: 'promo', amount: promo.starsReward, balanceAfter: u.balance, note: `Промокод ${code}` },
@@ -2468,35 +2388,51 @@ async function handlePay(
     await send(msg.chat.id, '⚠️ Укажите сумму: `/pay @user 50`')
     return
   }
-  if (user.balance < amount) {
-    await send(msg.chat.id, `❌ Недостаточно звёзд. Ваш баланс: ${user.balance}⭐`)
-    return
-  }
   const target = await db.user.findFirst({ where: { username: targetUsername } })
   if (!target) {
     await send(msg.chat.id, `⚠️ @${targetUsername} не найден. Юзер должен запустить /start.`)
     return
   }
 
-  // Atomic transfer
+  // FIX C4 + C5: Atomic transfer with fresh balance check inside tx.
+  // Pre-check on stale user.balance is unreliable under concurrent calls.
+  let result: { senderBalance: number; targetBalance: number }
   try {
-    await db.$transaction(async (tx) => {
-      await tx.user.update({ where: { id: user.id }, data: { balance: { decrement: amount } } })
-      await tx.user.update({ where: { id: target.id }, data: { balance: { increment: amount } } })
-      await tx.transaction.create({ data: { userId: user.id, type: 'transfer_out', amount: -amount, balanceAfter: user.balance - amount, note: `Перевод @${targetUsername}` } })
-      await tx.transaction.create({ data: { userId: target.id, type: 'transfer_in', amount, balanceAfter: target.balance + amount, note: `От ${user.username ? '@' + user.username : user.firstName}` } })
+    result = await db.$transaction(async (tx) => {
+      const fresh = await tx.user.findUnique({ where: { id: user.id } })
+      if (!fresh) throw new Error('user_missing')
+      if (fresh.balance < amount) throw new Error('insufficient_balance')
+      const u = await tx.user.update({
+        where: { id: user.id },
+        data: { balance: { decrement: amount } },
+      })
+      const t = await tx.user.findUnique({ where: { id: target.id } })
+      if (!t) throw new Error('target_missing')
+      const updatedTarget = await tx.user.update({
+        where: { id: target.id },
+        data: { balance: { increment: amount } },
+      })
+      await tx.transaction.create({ data: { userId: user.id, type: 'transfer_out', amount: -amount, balanceAfter: u.balance, note: `Перевод @${targetUsername}` } })
+      await tx.transaction.create({ data: { userId: target.id, type: 'transfer_in', amount, balanceAfter: updatedTarget.balance, note: `От ${user.username ? '@' + user.username : user.firstName}` } })
+      return { senderBalance: u.balance, targetBalance: updatedTarget.balance }
     })
-  } catch {
+  } catch (e) {
+    const err = String(e)
+    if (err.includes('insufficient_balance')) {
+      await send(msg.chat.id, `❌ Недостаточно звёзд. Попробуйте ещё раз.`)
+      return
+    }
+    console.error('[pay]', e)
     await send(msg.chat.id, '❌ Ошибка перевода. Попробуйте позже.')
     return
   }
 
   const senderName = user.username ? `@${user.username}` : user.firstName || `Игрок ${user.tgId.slice(-4)}`
-  await send(msg.chat.id, `✅ **Перевод выполнен!**\n💸 ${senderName} → @${targetUsername}\n💰 Сумма: **${amount}⭐**\nВаш баланс: ${user.balance - amount}⭐`)
+  await send(msg.chat.id, `✅ **Перевод выполнен!**\n💸 ${senderName} → @${targetUsername}\n💰 Сумма: **${amount}⭐**\nВаш баланс: ${result.senderBalance}⭐`)
 
   // Уведомить получателя
   try {
-    await send(target.tgId, `💸 **Вам перевод!**\nОт: ${senderName}\nСумма: **${amount}⭐**\nБаланс: ${target.balance + amount}⭐`)
+    await send(target.tgId, `💸 **Вам перевод!**\nОт: ${senderName}\nСумма: **${amount}⭐**\nБаланс: ${result.targetBalance}⭐`)
   } catch { /* ignore */ }
 }
 
@@ -2827,114 +2763,134 @@ async function handleAdminStatsCallback(cq: TgCallbackQuery) {
 }
 
 /* ------------------------------------------------------------------ */
-/* /sendgift — админ: отправить gift юзеру (простой способ, без фильтров) */
-/* /sendgift @user <amount> <count>                                    */
-/* /sendgift 1780243895 1000 5  (по tgId)                             */
+/* Admin: Withdrawals (manual approval flow)                          */
+/* /pending, /approve <id>, /reject <id>                              */
+/* admin_w_approve:<id>, admin_w_reject:<id> callbacks                */
 /* ------------------------------------------------------------------ */
 
-async function handleSendGift(
-  msg: TgMessage,
-  user: { id: string; isAdmin: boolean },
-  args: string[]
-) {
-  console.log(`[sendgift] called by user isAdmin=${user.isAdmin} args=${JSON.stringify(args)}`)
+/** Match withdrawal by full id or last-8 suffix. Returns withdrawal with user relation. */
+async function findWithdrawalById(idArg: string) {
+  // Try exact match first
+  const exact = await db.withdrawal.findUnique({
+    where: { id: idArg },
+    include: { user: { select: { tgId: true, username: true, firstName: true } } },
+  })
+  if (exact) return exact
+  // Try suffix match (last 8 chars is what users see in messages)
+  const suffix = idArg.toLowerCase()
+  const all = await db.withdrawal.findMany({
+    where: { status: 'pending' },
+    include: { user: { select: { tgId: true, username: true, firstName: true } } },
+  })
+  return all.find(w => w.id.toLowerCase().endsWith(suffix)) ?? null
+}
+
+async function handlePending(msg: TgMessage, user: { isAdmin: boolean }) {
   if (!user.isAdmin) {
     await send(msg.chat.id, '🚫 Только админ.')
     return
   }
-
-  const targetArg = args[0] ?? ''
-  const amountArg = args[1]
-  const countArg = args[2] || '1'
-
-  // Убираем @ если есть
-  const rawTarget = targetArg.replace(/^@/, '').trim()
-  const amount = parseAmount(amountArg)
-  const count = Math.min(Math.max(Number(countArg) || 1, 1), 50)
-
-  if (!rawTarget || !amount) {
-    await send(msg.chat.id, '⚠️ Использование:\n`/sendgift @user 1000 5`\n\nЦены: 15, 25, 50, 75, 100, 500, **666** 👹, 1000⭐')
+  const withdrawals = await db.withdrawal.findMany({
+    where: { status: 'pending' },
+    orderBy: { createdAt: 'asc' },
+    take: 10,
+    include: { user: { select: { tgId: true, username: true, firstName: true } } },
+  })
+  if (withdrawals.length === 0) {
+    await send(msg.chat.id, '✅ Нет pending заявок на вывод.')
     return
   }
+  const lines = withdrawals.map(w => {
+    const name = w.user.username ? `@${w.user.username}` : (w.user.firstName || `tg:${w.user.tgId}`)
+    const shortId = w.id.slice(-8)
+    const ago = timeAgo(w.createdAt)
+    return `• \`${shortId}\` — ${name} — ${w.amount}⭐ — ${ago}`
+  })
+  await send(msg.chat.id, `⏳ **Pending withdrawals (${withdrawals.length}):**\n\n${lines.join('\n')}\n\nApprove: \`/approve <id>\`\nReject: \`/reject <id>\``)
+}
 
-  // Простой поиск юзера: пробуем tgId (число) или username (lowercase)
-  let target: { tgId: string; username: string | null } | null = null
-
-  if (/^\d+$/.test(rawTarget)) {
-    // Число → ищем по tgId
-    target = await db.user.findUnique({
-      where: { tgId: rawTarget },
-      select: { tgId: true, username: true }
-    })
-    // Если не найден в БД, но это число — возможно юзер есть в AltGram
-    // Создадим запись в БД с этим tgId
-    if (!target) {
-      try {
-        const newUser = await db.user.create({
-          data: {
-            tgId: rawTarget,
-            username: null,
-            firstName: null,
-            balance: 0,
-          },
-        })
-        target = { tgId: newUser.tgId, username: null }
-        await send(msg.chat.id, `ℹ️ Юзер с tgId \`${rawTarget}\` добавлен в БД (не нажимал /start).`)
-      } catch (e) {
-        await send(msg.chat.id, `❌ Не удалось создать юзера с tgId \`${rawTarget}\`.`)
-        return
-      }
-    }
-  }
-  if (!target) {
-    // Не число или не найден по tgId → ищем по username (lowercase)
-    target = await db.user.findFirst({
-      where: { username: rawTarget.toLowerCase() },
-      select: { tgId: true, username: true }
-    })
-  }
-
-  // ЕСЛИ ЮЗЕРА НЕТ В БД — попросим админа переслать сообщение от юзера
-  if (!target) {
-    await send(
-      msg.chat.id,
-      [
-        `❌ Юзер \`${rawTarget}\` не найден в БД.`,
-        ``,
-        `**Два варианта:**`,
-        `1. Юзер должен отправить \`/start\` боту @duelsbot`,
-        `2. Или вы можете переслать сообщение от этого юзера — бот сохранит его в БД`,
-        ``,
-        `Также можно отправить gift по tgId:`,
-        `\`/sendgift <tgId> ${amount} ${count}\``,
-        ``,
-        `Например: \`/sendgift 1780243895 ${amount} ${count}\``,
-      ].join('\n')
-    )
+async function handleApprove(msg: TgMessage, user: { isAdmin: boolean }, idArg?: string) {
+  if (!user.isAdmin) {
+    await send(msg.chat.id, '🚫 Только админ.')
     return
   }
-
-  const displayName = target.username ? `@${target.username}` : `tg:${target.tgId}`
-  await send(msg.chat.id, `⏳ Отправляю ${count} gifts по ${amount}⭐ юзеру ${displayName}...`)
-
-  const { sent, failed } = await sendGiftToUser(target.tgId, amount, count)
-
-  await send(
-    msg.chat.id,
-    [
-      `🎁 **Результат:**`,
-      `👤 Юзер: ${displayName}`,
-      `💰 ${amount}⭐ × ${count}`,
-      `✅ Отправлено: ${sent}`,
-      `❌ Не удалось: ${failed}`,
-    ].join('\n')
-  )
-
-  if (sent > 0) {
-    try {
-      await send(target.tgId, `🎁 Вам отправлено ${sent} gifts по ${amount}⭐ от админа!`)
-    } catch { /* ignore */ }
+  if (!idArg) {
+    await send(msg.chat.id, '⚠️ `/approve <withdrawalId>` — последние 8 символов ID или полный ID.')
+    return
   }
+  const w = await findWithdrawalById(idArg)
+  if (!w) {
+    await send(msg.chat.id, `❌ Заявка не найдена.`)
+    return
+  }
+  if (w.status !== 'pending') {
+    await send(msg.chat.id, `⚠️ Заявка уже обработана (status: ${w.status}).`)
+    return
+  }
+  // Atomic: only update if still pending
+  const updated = await db.withdrawal.updateMany({
+    where: { id: w.id, status: 'pending' },
+    data: { status: 'fulfilled', fulfilledAt: new Date(), note: `${w.note ?? ''} — approved by admin`.trim() },
+  })
+  if (updated.count === 0) {
+    await send(msg.chat.id, `⚠️ Заявка уже обработана.`)
+    return
+  }
+  const name = w.user.username ? `@${w.user.username}` : `tg:${w.user.tgId}`
+  await send(msg.chat.id, `✅ Заявка \`${w.id.slice(-8)}\` отмечена выполненной.\n👤 Игрок: ${name}\n💸 Сумма: ${w.amount}⭐`)
+  try {
+    await send(w.user.tgId, `✅ **Вывод #${w.id.slice(-8)} выполнен!**\n💸 Сумма: ${w.amount}⭐\nПроверьте Telegram — подарок должен прийти.`)
+  } catch { /* ignore */ }
+}
+
+async function handleReject(msg: TgMessage, user: { isAdmin: boolean }, idArg?: string) {
+  if (!user.isAdmin) {
+    await send(msg.chat.id, '🚫 Только админ.')
+    return
+  }
+  if (!idArg) {
+    await send(msg.chat.id, '⚠️ `/reject <withdrawalId>`')
+    return
+  }
+  const w = await findWithdrawalById(idArg)
+  if (!w) {
+    await send(msg.chat.id, `❌ Заявка не найдена.`)
+    return
+  }
+  if (w.status !== 'pending') {
+    await send(msg.chat.id, `⚠️ Заявка уже обработана (status: ${w.status}).`)
+    return
+  }
+  // Atomic: only update if still pending
+  const updated = await db.withdrawal.updateMany({
+    where: { id: w.id, status: 'pending' },
+    data: { status: 'failed', note: `${w.note ?? ''} — rejected by admin`.trim() },
+  })
+  if (updated.count === 0) {
+    await send(msg.chat.id, `⚠️ Заявка уже обработана.`)
+    return
+  }
+  // Refund balance to user
+  await creditBalance(w.userId, w.amount, 'refund', `Возврат отклонённой заявки на вывод #${w.id.slice(-8)}`)
+  await send(msg.chat.id, `❌ Заявка \`${w.id.slice(-8)}\` отклонена.\n💸 Возврат ${w.amount}⭐ на баланс игроку.`)
+  try {
+    const newBal = (await db.user.findUnique({ where: { id: w.userId } }))?.balance ?? 0
+    await send(w.user.tgId, `❌ **Заявка на вывод #${w.id.slice(-8)} отклонена.**\n💸 Возврат ${w.amount}⭐ на баланс.\n💰 Баланс: ${newBal}⭐`)
+  } catch { /* ignore */ }
+}
+
+async function handleAdminWithdrawApprove(cq: TgCallbackQuery, idArg: string) {
+  const from = cq.from!
+  const user = await upsertUser(from)
+  if (!user.isAdmin) return
+  await handleApprove({ chat: { id: cq.from.id, type: 'private' }, from: cq.from, message_id: 0, date: 0 } as TgMessage, user, idArg)
+}
+
+async function handleAdminWithdrawReject(cq: TgCallbackQuery, idArg: string) {
+  const from = cq.from!
+  const user = await upsertUser(from)
+  if (!user.isAdmin) return
+  await handleReject({ chat: { id: cq.from.id, type: 'private' }, from: cq.from, message_id: 0, date: 0 } as TgMessage, user, idArg)
 }
 
 /* ------------------------------------------------------------------ */
@@ -3163,7 +3119,7 @@ async function handleWithdrawCallback(cq: TgCallbackQuery, amountStr: string) {
   // callback already answered at top
 
   const amount = Number(amountStr)
-  const validWithdrawAmounts = [50, 100, 500, 1000]
+  const validWithdrawAmounts = [50, 100, 500, 666, 1000]
   if (!validWithdrawAmounts.includes(amount)) {
     return
   }
